@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>lifeOs Visualizer</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1a1a; }
+    #c { width: 100%; height: 100%; display: block; }
+    #hint { position: fixed; left: 8px; bottom: 6px; color: #888;
+            font: 12px sans-serif; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hint">drag to orbit &nbsp;&middot;&nbsp; scroll to zoom</div>
+
+  <!-- Classic (UMD) builds + Qt's web-channel shim, loaded from sibling files. -->
+  <script src="qwebchannel.js"></script>
+  <script src="three.min.js"></script>
+  <script src="OrbitControls.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

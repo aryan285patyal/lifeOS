@@ -15,12 +15,14 @@ calib_left = 0                     # samples still needed to finish a recalibrat
 
 
 def parse(raw):
-    """ 'ax:1,ay:-2,...' -> {'ax': 1, 'ay': -2, ...}  (None if malformed). """
+    """ 'q0:1.0,..,ax:1,ay:-2,...' -> dict (None if malformed).
+
+    Quaternion fields (q0..q3) are floats; accel/gyro fields are ints. """
     values = {}
     for pair in raw.split(','):
         key, _, val = pair.partition(':')
         try:
-            values[key] = int(val)
+            values[key] = float(val) if key.startswith('q') else int(val)
         except ValueError:
             return None
     if not all(f in values for f in FIELDS):

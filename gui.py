@@ -8,13 +8,17 @@ import time
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QLineEdit, QPushButton,
+    QLineEdit, QPushButton, QTabWidget,
 )
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal
 from PySide6.QtGui import QColor
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebChannel import QWebChannel
 
 from CleanInput import CleanInput, format_converted
 from live_charts import ChartPanel
+
+QUAT = ["q0", "q1", "q2", "q3"]
 
 SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
 
@@ -85,7 +89,8 @@ class Listener:
                     parsed_data = {}
                     for pair in data.decode().split(','):
                         key, value = pair.split(':')
-                        parsed_data[key] = int(value)
+                        # quaternion fields (q0..q3) are floats; raw counts are ints
+                        parsed_data[key] = float(value) if key.startswith('q') else int(value)
                     with self.lock:
                         self.latest = parsed_data
                         self.last_seen = time.monotonic()
@@ -99,6 +104,51 @@ class Listener:
     def is_connected(self, timeout=1.0):
         with self.lock:
             return (time.monotonic() - self.last_seen) <= timeout
+
+
+class OrientationBridge(QObject):
+    """Exposed to the three.js page over QWebChannel."""
+    orientation = Signal(float, float, float, float)  # w, x, y, z
+    zeroRequested = Signal()                           # "Zero / Level" pressed
+
+
+class VisualizerTab(QWidget):
+    """A QWebEngineView hosting the three.js scene, fed the device quaternion."""
+
+    def __init__(self, listener):
+        super().__init__()
+        self.listener = listener
+
+        layout = QVBoxLayout(self)
+
+        self.view = QWebEngineView()
+        self.channel = QWebChannel()
+        self.bridge = OrientationBridge()
+        self.channel.registerObject("bridge", self.bridge)
+        self.view.page().setWebChannel(self.channel)
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        index = os.path.join(here, "web", "index.html")
+        self.view.setUrl(QUrl.fromLocalFile(index))
+        layout.addWidget(self.view)
+
+        self.zero_btn = QPushButton("Zero / Level")
+        self.zero_btn.clicked.connect(lambda: self.bridge.zeroRequested.emit())
+        layout.addWidget(self.zero_btn)
+
+        # Push the latest quaternion to the page at ~30 Hz, independent of the
+        # Monitor tab's refresh so the 3D view stays smooth.
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(33)
+
+    def _tick(self):
+        values, _ = self.listener.snapshot()
+        if values and all(k in values for k in QUAT):
+            self.bridge.orientation.emit(
+                float(values["q0"]), float(values["q1"]),
+                float(values["q2"]), float(values["q3"]),
+            )
 
 
 class MonitorWindow(QMainWindow):
@@ -167,7 +217,12 @@ class MonitorWindow(QMainWindow):
         layout.addLayout(kill_row)
 
         central_widget.setLayout(layout)
-        self.setCentralWidget(central_widget)
+
+        tabs = QTabWidget()
+        tabs.addTab(central_widget, "Monitor")
+        self.visualizer = VisualizerTab(self.listener)
+        tabs.addTab(self.visualizer, "Visualizer")
+        self.setCentralWidget(tabs)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh)
@@ -255,11 +310,13 @@ class MonitorWindow(QMainWindow):
 
 
 def main():
+    # QtWebEngine wants shared GL contexts set before the QApplication exists.
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     listener = Listener()
     listener.start()
     win = MonitorWindow(listener)
-    win.resize(440, 780)
+    win.resize(720, 860)
     win.show()
     sys.exit(app.exec())
 
