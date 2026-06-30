@@ -1,0 +1,4 @@
+# Pinned to 6.8.0.2: PySide6 6.9+ needs a newer MSVC runtime than the
+# Anaconda base Python loads (14.42), which causes
+# "DLL load failed while importing QtCore: The specified procedure could not be found".
+PySide6==6.8.0.2
