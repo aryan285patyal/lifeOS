@@ -28,8 +28,9 @@ SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
 NUM_SERVOS = 2                        # must match NUM_SERVOS in lifeOs.ino
 SERVO_GPIOS = [13, 25]               # for display only; matches SERVO_PINS in firmware
 SERVO_KEYS = [f"s{i}" for i in range(NUM_SERVOS)]  # echoed angle fields in telemetry
-UDP_PORT = 5005                       # telemetry port (WiFi mode); matches UDP_PORT in lifeOs.ino
-CMD_PORT = 5006                       # must match CMD_PORT in lifeOs.ino
+UDP_PORT = 5005                       # telemetry port (legacy WiFi sensor mode)
+CMD_PORT = 5006                       # legacy WiFi command/hello port
+VIDEO_PORT = 5010                     # laptop receives Wi-Fi video UDP here (matches lifeOs.ino)
 
 # mDNS service the ESP32 advertises (MDNS.addService("lifeos", "udp", ...)).
 SERVICE_TYPE = "_lifeos._udp.local."
@@ -58,6 +59,19 @@ def looks_like_ip(s):
     return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
+def get_local_ip():
+    """The laptop's IP on the interface that reaches the internet (usually Wi-Fi).
+    This is the address the ESP32 will send video UDP to."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))       # no packet sent; just selects the route
+        return s.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        s.close()
+
+
 def list_serial_ports():
     """[(device, description)] of COM ports, or [] if pyserial isn't installed."""
     try:
@@ -65,6 +79,37 @@ def list_serial_ports():
     except Exception:
         return []
     return [(p.device, p.description) for p in lp.comports()]
+
+
+def probe_lifeos_port(timeout=1.5, skip=None):
+    """Open each COM port, ask 'id?', and return the device that answers as a
+    lifeOs ESP32 (or is already streaming lifeOs telemetry). None if not found.
+    `skip` is a set of devices to leave alone (e.g. one already open by us)."""
+    try:
+        import serial
+    except Exception:
+        return None
+    skip = skip or set()
+    for dev, _desc in list_serial_ports():
+        if dev in skip:
+            continue
+        try:
+            with serial.Serial(dev, 115200, timeout=0.3, write_timeout=0.5) as s:
+                try:
+                    s.write(b"id?\n")
+                except Exception:
+                    pass
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    raw = s.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode(errors="ignore").strip()
+                    if line.startswith("id:lifeos") or ("q0:" in line and "s0:" in line):
+                        return dev
+        except Exception:
+            continue   # port busy / not openable / not ours
+    return None
 
 CALIB_SAMPLES = 20          # fresh samples averaged into the zero baseline on reset
 
@@ -277,6 +322,18 @@ class BluetoothLink(Link):
         except Exception:
             return False
 
+    def provision_video(self, ssid, password, ip):
+        """Send Wi-Fi credentials + the laptop's IP so the ESP32 brings up Wi-Fi
+        and streams video UDP back to us. Format: 'wifi:<ssid>|<pass>|<ip>'."""
+        if not self.ser:
+            return False
+        msg = f"wifi:{ssid}|{password}|{ip}\n"
+        try:
+            self.ser.write(msg.encode())
+            return True
+        except Exception:
+            return False
+
     def description(self):
         return f"Bluetooth {self.com}"
 
@@ -364,6 +421,20 @@ class DeviceDiscovery(ServiceListener):
         except Exception:
             pass
         self.zc.close()
+
+
+class PortProber(QObject):
+    """Runs probe_lifeos_port() off the GUI thread and reports the matched COM
+    device via a signal (Qt queues it back onto the GUI thread safely)."""
+
+    found = Signal(str)     # matched device, or "" if none
+
+    def probe(self, skip=None):
+        threading.Thread(target=self._run, args=(skip,), daemon=True).start()
+
+    def _run(self, skip):
+        dev = probe_lifeos_port(skip=skip)
+        self.found.emit(dev or "")
 
 
 class OrientationBridge(QObject):
@@ -517,24 +588,26 @@ class ServoTab(QWidget):
 
 
 class ConnectTab(QWidget):
-    """Pick a transport (Bluetooth or Wi-Fi) and connect to the ESP32.
+    """Set up the ESP32's two channels, in two sections:
 
-    Bluetooth: lists paired COM ports; Connect opens the port and streams over
-    SPP -- network-independent, keeps the laptop's internet free.
-    Wi-Fi: mDNS device list + a manual IP/hostname fallback; Connect sends a
-    'hello' that starts the two-way UDP stream.
-    Either way the chosen link is handed to the ConnectionManager, so the other
-    tabs are unaffected. A remembered default auto-connects on launch."""
+    * Bluetooth (sensor & servos) -- pick the paired COM port ("Find lifeOs port"
+      auto-detects it), Connect, optionally Save as default. This is the always-on
+      control link the Monitor/Visualizer/Servos tabs read from.
+    * Wi-Fi (video) -- enter the Wi-Fi SSID/password and confirm the laptop IP,
+      then Connect: these are sent to the ESP32 OVER BLUETOOTH, and the ESP32
+      brings up Wi-Fi and streams video UDP back to that IP. Sending the laptop's
+      current IP each time sidesteps the changing-DHCP-address problem."""
 
-    def __init__(self, manager, discovery):
+    def __init__(self, manager):
         super().__init__()
         self.manager = manager
-        self.discovery = discovery
         self.config = load_connect_config()
-        self._wifi_rows = []       # row -> (service_name, ip, port)
-        self._bt_rows = []         # row -> (com_device, description)
-        self._last_keys = None
-        self._auto_attempted = False
+        self._bt_rows = []             # row -> (com_device, description)
+        self._detected_bt = None       # COM port confirmed to be lifeOs, if any
+        self._auto_bt_attempted = False
+        self._auto_video_attempted = False
+        self.prober = PortProber()
+        self.prober.found.connect(self._on_probe_found)
 
         root = QVBoxLayout(self)
 
@@ -550,147 +623,38 @@ class ConnectTab(QWidget):
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
 
-        # transport selector -> switches the panel below
-        trow = QHBoxLayout()
-        trow.addWidget(QLabel("Transport:"))
-        self.transport = QComboBox()
-        self.transport.addItem("Bluetooth (SPP)", "bluetooth")   # index 0
-        self.transport.addItem("Wi-Fi (UDP)", "wifi")            # index 1
-        self.transport.currentIndexChanged.connect(self.stack_index_changed)
-        trow.addWidget(self.transport, 1)
-        root.addLayout(trow)
-
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_bt_page())    # index 0
-        self.stack.addWidget(self._build_wifi_page())  # index 1
-        root.addWidget(self.stack, 1)
-
-        self.default_chk = QCheckBox("Make this my default connection")
-        self.default_chk.setChecked(bool(self.config.get("default_transport")))
-        root.addWidget(self.default_chk)
-
-        # restore the last-used transport
-        want = self.config.get("default_transport", "bluetooth")
-        idx = 1 if want == "wifi" else 0
-        self.transport.setCurrentIndex(idx)
-        self.stack.setCurrentIndex(idx)
+        root.addWidget(self._build_bt_group())
+        root.addWidget(self._build_video_group())
+        root.addStretch(1)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(1000)
-        self.refresh_wifi()
         self.refresh_bt()
 
-    def stack_index_changed(self, idx):
-        self.stack.setCurrentIndex(idx)
-
-    # --- page builders ---
-    def _build_bt_page(self):
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.addWidget(QLabel("Paired Bluetooth COM ports:"))
+    # --- Bluetooth (sensor & servos) ---
+    def _build_bt_group(self):
+        box = QGroupBox("Bluetooth  -  sensor & servos")
+        v = QVBoxLayout(box)
         self.bt_list = QListWidget()
         self.bt_list.itemDoubleClicked.connect(lambda _: self.connect_bt())
-        v.addWidget(self.bt_list, 1)
+        v.addWidget(self.bt_list)
         row = QHBoxLayout()
         self.bt_refresh_btn = QPushButton("Refresh ports")
         self.bt_refresh_btn.clicked.connect(self.refresh_bt)
+        self.bt_find_btn = QPushButton("Find lifeOs port")
+        self.bt_find_btn.clicked.connect(self.find_lifeos)
         self.bt_connect_btn = QPushButton("Connect")
         self.bt_connect_btn.clicked.connect(self.connect_bt)
-        row.addWidget(self.bt_refresh_btn)
-        row.addWidget(self.bt_connect_btn)
+        self.bt_default_btn = QPushButton("Save as default")
+        self.bt_default_btn.clicked.connect(self.save_bt_default)
+        for b in (self.bt_refresh_btn, self.bt_find_btn, self.bt_connect_btn, self.bt_default_btn):
+            row.addWidget(b)
         v.addLayout(row)
-        v.addWidget(QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth settings first."))
-        return page
+        v.addWidget(QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth first, then "
+                           "\"Find lifeOs port\" to auto-detect which COM it is."))
+        return box
 
-    def _build_wifi_page(self):
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.addWidget(QLabel("Discovered lifeOs devices (mDNS):"))
-        self.device_list = QListWidget()
-        self.device_list.itemDoubleClicked.connect(lambda _: self.connect_selected())
-        v.addWidget(self.device_list, 1)
-        row = QHBoxLayout()
-        self.refresh_btn = QPushButton("Refresh devices")
-        self.refresh_btn.clicked.connect(self.refresh_wifi)
-        self.connect_btn = QPushButton("Connect to selected")
-        self.connect_btn.clicked.connect(self.connect_selected)
-        row.addWidget(self.refresh_btn)
-        row.addWidget(self.connect_btn)
-        v.addLayout(row)
-        manual = QHBoxLayout()
-        manual.addWidget(QLabel("Or connect directly:"))
-        self.manual_edit = QLineEdit()
-        self.manual_edit.setPlaceholderText("172.16.72.32  or  lifeos.local")
-        self.manual_edit.returnPressed.connect(self.connect_manual)
-        self.manual_btn = QPushButton("Connect")
-        self.manual_btn.clicked.connect(self.connect_manual)
-        manual.addWidget(self.manual_edit, 1)
-        manual.addWidget(self.manual_btn)
-        v.addLayout(manual)
-        return page
-
-    # --- Wi-Fi ---
-    def _ensure_wifi_link(self):
-        if not isinstance(self.manager.active, WifiLink):
-            link = WifiLink()
-            link.start()
-            self.manager.set_active(link)   # stops any previous (e.g. Bluetooth)
-        return self.manager.active
-
-    def _populate_wifi(self, devices):
-        prev = None
-        r = self.device_list.currentRow()
-        if 0 <= r < len(self._wifi_rows):
-            prev = self._wifi_rows[r][0]
-        self.device_list.clear()
-        self._wifi_rows = []
-        for name, (ip, port) in sorted(devices.items()):
-            self.device_list.addItem(f"{name.split('.')[0]}    ({ip})")
-            self._wifi_rows.append((name, ip, port))
-        if not self._wifi_rows:
-            self.device_list.addItem("(no lifeOs devices found - power on the ESP32, then Refresh)")
-        for i, (name, _ip, _p) in enumerate(self._wifi_rows):
-            if name == prev:
-                self.device_list.setCurrentRow(i)
-                break
-
-    def refresh_wifi(self):
-        self._populate_wifi(self.discovery.devices())
-
-    def connect_selected(self):
-        r = self.device_list.currentRow()
-        if not (0 <= r < len(self._wifi_rows)):
-            self.status_label.setText("Select a device from the list first.")
-            return
-        name, ip, _p = self._wifi_rows[r]
-        self._connect_wifi(name, ip)
-
-    def connect_manual(self):
-        text = self.manual_edit.text().strip()
-        if not text:
-            self.status_label.setText("Enter the ESP32's IP (from the serial monitor) or lifeos.local.")
-            return
-        ip = text
-        if not looks_like_ip(text):
-            try:
-                ip = socket.gethostbyname(text)   # resolve lifeos.local via the OS
-            except OSError:
-                self.status_label.setText(
-                    f"Could not resolve '{text}'. Type the IP shown on the serial monitor instead.")
-                return
-        self._connect_wifi(text, ip)
-
-    def _connect_wifi(self, name, ip):
-        link = self._ensure_wifi_link()
-        ok = link.register_peer(ip)
-        label = name.split('.')[0]
-        self.status_label.setText(
-            f"Sent hello to {label} ({ip}) - waiting for telemetry..." if ok
-            else f"Could not reach {label} ({ip}).")
-        self._save_default("wifi", name)
-
-    # --- Bluetooth ---
     def _populate_bt(self):
         prev = None
         r = self.bt_list.currentRow()
@@ -699,7 +663,10 @@ class ConnectTab(QWidget):
         self.bt_list.clear()
         self._bt_rows = []
         for dev, desc in list_serial_ports():
-            self.bt_list.addItem(f"{dev}    {desc}")
+            label = f"{dev}    {desc}"
+            if dev == self._detected_bt:
+                label += "   <- lifeOs"
+            self.bt_list.addItem(label)
             self._bt_rows.append((dev, desc))
         if not self._bt_rows:
             self.bt_list.addItem("(no COM ports - pair the ESP32 first, or install pyserial)")
@@ -711,13 +678,38 @@ class ConnectTab(QWidget):
     def refresh_bt(self):
         self._populate_bt()
 
+    def find_lifeos(self):
+        """Probe every COM port for the lifeOs identity so the user doesn't have
+        to guess which one it is. Skips a port we already hold open."""
+        skip = set()
+        if isinstance(self.manager.active, BluetoothLink):
+            skip.add(self.manager.active.com)
+        self.bt_find_btn.setEnabled(False)
+        self.bt_find_btn.setText("Probing...")
+        self.status_label.setText("Probing COM ports for lifeOs (opens each briefly)...")
+        self.prober.probe(skip=skip)
+
+    def _on_probe_found(self, dev):
+        self.bt_find_btn.setEnabled(True)
+        self.bt_find_btn.setText("Find lifeOs port")
+        if dev:
+            self._detected_bt = dev
+            self._populate_bt()
+            for i, (d, _desc) in enumerate(self._bt_rows):
+                if d == dev:
+                    self.bt_list.setCurrentRow(i)
+                    break
+            self.status_label.setText(f"Found lifeOs on {dev}. Press Connect.")
+        else:
+            self.status_label.setText(
+                "No lifeOs device found on any COM port. Is it paired and powered on?")
+
     def connect_bt(self):
         r = self.bt_list.currentRow()
         if not (0 <= r < len(self._bt_rows)):
             self.status_label.setText("Select a COM port first (or Refresh ports).")
             return
-        dev, _desc = self._bt_rows[r]
-        self._connect_bt(dev)
+        self._connect_bt(self._bt_rows[r][0])
 
     def _connect_bt(self, com):
         try:
@@ -726,61 +718,100 @@ class ConnectTab(QWidget):
         except Exception as e:
             self.status_label.setText(f"Could not open {com}: {e}")
             return
-        self.manager.set_active(link)           # stops any previous (e.g. Wi-Fi)
-        self.status_label.setText(f"Opened {com} - waiting for telemetry...")
-        self._save_default("bluetooth", com)
+        self.manager.set_active(link)
+        self.status_label.setText(f"Opened {com} - waiting for sensor telemetry...")
+
+    def save_bt_default(self):
+        r = self.bt_list.currentRow()
+        if not (0 <= r < len(self._bt_rows)):
+            self.status_label.setText("Select a COM port to save as default.")
+            return
+        self.config["bt_port"] = self._bt_rows[r][0]
+        save_connect_config(self.config)
+        self.status_label.setText(f"Saved {self._bt_rows[r][0]} as the default Bluetooth port.")
+
+    # --- Wi-Fi (video) ---
+    def _build_video_group(self):
+        box = QGroupBox("Wi-Fi  -  video")
+        form = QVBoxLayout(box)
+
+        ssid_row = QHBoxLayout()
+        ssid_row.addWidget(QLabel("SSID:"))
+        self.ssid_edit = QLineEdit(self.config.get("video_ssid", ""))
+        self.ssid_edit.setPlaceholderText("your Wi-Fi network name")
+        ssid_row.addWidget(self.ssid_edit, 1)
+        form.addLayout(ssid_row)
+
+        pass_row = QHBoxLayout()
+        pass_row.addWidget(QLabel("Password:"))
+        self.pass_edit = QLineEdit(self.config.get("video_pass", ""))
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        pass_row.addWidget(self.pass_edit, 1)
+        form.addLayout(pass_row)
+
+        ip_row = QHBoxLayout()
+        ip_row.addWidget(QLabel("Laptop IP:"))
+        self.ip_edit = QLineEdit(get_local_ip())
+        self.ip_edit.setToolTip("The ESP32 sends video UDP here (auto-detected; edit if wrong).")
+        ip_row.addWidget(self.ip_edit, 1)
+        form.addLayout(ip_row)
+
+        row = QHBoxLayout()
+        self.video_connect_btn = QPushButton("Connect (start video)")
+        self.video_connect_btn.clicked.connect(self.connect_video)
+        self.video_default_btn = QPushButton("Save as default")
+        self.video_default_btn.clicked.connect(self.save_video_default)
+        row.addWidget(self.video_connect_btn)
+        row.addWidget(self.video_default_btn)
+        form.addLayout(row)
+
+        form.addWidget(QLabel(f"Credentials go to the ESP32 over Bluetooth; it then streams video "
+                              f"UDP to Laptop IP:{VIDEO_PORT}. Verify with wifi_video_test.py."))
+        return box
+
+    def connect_video(self):
+        if not isinstance(self.manager.active, BluetoothLink):
+            self.status_label.setText(
+                "Connect over Bluetooth first - Wi-Fi credentials are sent to the ESP32 over Bluetooth.")
+            return
+        ssid = self.ssid_edit.text().strip()
+        password = self.pass_edit.text()
+        ip = self.ip_edit.text().strip() or get_local_ip()
+        if not ssid or not ip:
+            self.status_label.setText("Enter the Wi-Fi SSID and confirm the laptop IP.")
+            return
+        if self.manager.active.provision_video(ssid, password, ip):
+            self.status_label.setText(
+                f"Sent Wi-Fi creds to ESP32 (SSID '{ssid}', video -> {ip}:{VIDEO_PORT}). "
+                f"Run wifi_video_test.py to verify.")
+        else:
+            self.status_label.setText("Failed to send credentials over Bluetooth.")
+
+    def save_video_default(self):
+        self.config["video_ssid"] = self.ssid_edit.text().strip()
+        self.config["video_pass"] = self.pass_edit.text()
+        save_connect_config(self.config)
+        self.status_label.setText("Saved Wi-Fi video defaults.")
 
     # --- shared ---
-    def _save_default(self, transport, target):
-        if self.default_chk.isChecked():
-            self.config["default_transport"] = transport
-            self.config["wifi_target" if transport == "wifi" else "bt_port"] = target
-        elif self.config.get("default_transport") == transport:
-            self.config.pop("default_transport", None)
-        save_connect_config(self.config)
-
     def _tick(self):
-        devices = self.discovery.devices()
-        keys = tuple(sorted(devices))
-        if keys != self._last_keys:
-            self._last_keys = keys
-            self._populate_wifi(devices)
-
         if self.manager.is_connected():
             self.status_label.setText(f"Connected - {self.manager.description()}")
             self.status_label.setStyleSheet("color: #2e7d32;")
 
-        self._auto_connect(devices)
-
-    def _auto_connect(self, devices):
-        if self._auto_attempted:
-            return
-        transport = self.config.get("default_transport")
-        if transport == "bluetooth":
+        # auto-connect the saved Bluetooth port once it appears
+        if not self._auto_bt_attempted:
             com = self.config.get("bt_port")
             if com and any(dev == com for dev, _ in list_serial_ports()):
-                self._auto_attempted = True
-                self.default_chk.setChecked(True)
+                self._auto_bt_attempted = True
                 self._connect_bt(com)
-        elif transport == "wifi":
-            target = self.config.get("wifi_target")
-            if not target:
-                return
-            if target in devices:                        # a discovered mDNS device
-                self._auto_attempted = True
-                self.default_chk.setChecked(True)
-                self._connect_wifi(target, devices[target][0])
-            elif not target.endswith(SERVICE_TYPE):      # a saved manual IP / hostname
-                ip = target if looks_like_ip(target) else None
-                if ip is None:
-                    try:
-                        ip = socket.gethostbyname(target)
-                    except OSError:
-                        ip = None
-                if ip:
-                    self._auto_attempted = True
-                    self.default_chk.setChecked(True)
-                    self._connect_wifi(target, ip)
+
+        # once Bluetooth is up, auto-provision saved Wi-Fi video creds once
+        if (not self._auto_video_attempted and self.config.get("video_ssid")
+                and isinstance(self.manager.active, BluetoothLink)
+                and self.manager.is_connected()):
+            self._auto_video_attempted = True
+            self.connect_video()
 
 
 class MonitorWindow(QMainWindow):
@@ -850,11 +881,9 @@ class MonitorWindow(QMainWindow):
 
         central_widget.setLayout(layout)
 
-        self.discovery = DeviceDiscovery()
-
         tabs = QTabWidget()
         tabs.setTabBar(StretchTabBar())        # tabs span the full window width
-        self.connect_tab = ConnectTab(self.listener, self.discovery)
+        self.connect_tab = ConnectTab(self.listener)
         tabs.addTab(self.connect_tab, "Connect")
         tabs.addTab(central_widget, "Monitor")
         self.visualizer = VisualizerTab(self.listener)
@@ -950,10 +979,6 @@ class MonitorWindow(QMainWindow):
     def closeEvent(self, event):
         try:
             self.listener.close()    # stop the active link (socket / COM port)
-        except Exception:
-            pass
-        try:
-            self.discovery.close()   # stop the zeroconf browser threads cleanly
         except Exception:
             pass
         super().closeEvent(event)

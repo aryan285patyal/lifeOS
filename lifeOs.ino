@@ -1,59 +1,39 @@
-// lifeOs.ino  --  ESP32 + MPU6050 (DMP) -> telemetry over a swappable link
+// lifeOs.ino  --  ESP32 + MPU6050 (DMP): Bluetooth sensor/servo link + Wi-Fi video
 //
-// The MPU6050's on-chip DMP produces a fused orientation quaternion; we also
-// forward the raw accel/gyro counts and the current servo angles so the PC-side
-// GUI (Monitor / Visualizer / Servos tabs) all work off one stream.
+// Two concurrent channels, each playing to its strength:
+//   * BLUETOOTH (Classic SPP, always on) -- sensor telemetry out (quaternion +
+//     raw counts + servo echo), servo commands in, and Wi-Fi PROVISIONING in.
+//     Reliable, network-independent, keeps the laptop's Wi-Fi free.
+//   * WI-FI (station, on demand) -- high-bandwidth VIDEO out over UDP. Brought
+//     up only after the laptop sends Wi-Fi credentials + its own IP over
+//     Bluetooth, so a changing laptop DHCP address is handled every boot and
+//     nothing is hardcoded. (Camera is future work; for now a synthetic frame
+//     stream lets us test the Wi-Fi path.)
 //
-// TRANSPORT: set USE_BLUETOOTH below. Both transports carry the SAME newline-
-// delimited ASCII protocol, so the PC side only changes where it reads bytes:
-//   * 1 = Bluetooth Classic SPP  -> appears as a COM port on the laptop; keeps
-//         the laptop's WiFi/internet free and ignores the local network (no
-//         router, no client isolation, no mDNS needed).
-//   * 0 = WiFi / UDP            -> mDNS discovery + two-way UDP (needs a network
-//         that allows peer-to-peer traffic).
-// The link is isolated behind linkBegin()/linkConnected()/linkSend()/linkPoll()
-// so loop() and the IMU task are transport-agnostic (this is the seam the PC's
-// connection-method selector will mirror).
+// Provisioning line (over Bluetooth):  wifi:<ssid>|<password>|<laptop_ip>
+// Identity query (over Bluetooth):     id?  ->  id:lifeos,proto:1,servos:N
 //
-// Concurrency (ESP-WROOM-32, dual core):
-//   * IMU task pinned to core 0 drains the DMP FIFO promptly (interrupt-driven
-//     on GPIO4) and publishes the latest sample into a spinlock-guarded struct.
-//   * The Arduino loop() (core 1) reads that struct and transmits over the link.
+// Concurrency: an IMU task on core 0 drains the DMP FIFO (interrupt on GPIO4);
+// loop() on core 1 runs Bluetooth + the Wi-Fi video sender.
 //
-// Requires the "MPU6050" library by Electronic Cats (bundles I2Cdev +
-// MPU6050_6Axis_MotionApps20). WiFi mode also needs WIFI_SSID/WIFI_PASSWORD in
-// secrets.h. Bluetooth mode needs the Arduino IDE "Tools > Partition Scheme" set
-// to one with room for the BT stack + DMP blob (e.g. "Huge APP" / "Minimal
-// SPIFFS"); the default partition may overflow.
-
-#define USE_BLUETOOTH 1              // 1 = Bluetooth SPP link, 0 = WiFi/UDP link
+// Libraries: "MPU6050" by Electronic Cats, "ESP32Servo". WiFi/WiFiUdp/
+// BluetoothSerial ship with the ESP32 core. BT + Wi-Fi + the DMP blob need a
+// large partition scheme (Tools > Partition Scheme > "Huge APP").
 
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
 #include <ESP32Servo.h>
-
-#if USE_BLUETOOTH
-  #include "BluetoothSerial.h"
-  BluetoothSerial SerialBT;
-  const char* BT_NAME = "lifeos";    // name the laptop pairs with
-#else
-  #include <WiFi.h>
-  #include <WiFiUdp.h>
-  #include <ESPmDNS.h>
-  #include "secrets.h"               // WIFI_SSID, WIFI_PASSWORD
-  const char* MDNS_NAME = "lifeos";  // claims lifeos.local + _lifeos._udp service
-  const int   UDP_PORT  = 5005;      // telemetry TX (ESP32 -> PC)
-  const int   CMD_PORT  = 5006;      // servo commands + PC "hello" RX (PC -> ESP32)
-  // Learned at runtime from the first packet the PC sends us; nothing hardcoded.
-  IPAddress   pcIp;
-  bool        havePc = false;
-  WiFiUDP     udp;                    // telemetry out
-  WiFiUDP     cmdUdp;                 // commands in
-#endif
+#include "BluetoothSerial.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
 
 #define INTERRUPT_PIN 4              // MPU6050 INT -> ESP32 GPIO4
-const long  interval = 20;           // telemetry TX period, ms (50 Hz)
+const char*  BT_NAME       = "lifeos";
+const long   interval      = 20;     // sensor TX period, ms (50 Hz)
+const int    VIDEO_PORT    = 5010;   // laptop receives video UDP here
+const size_t VIDEO_PKT     = 1024;   // synthetic video packet size, bytes
+const long   videoInterval = 20;     // video frame period, ms
 
 // --- Servos: GPIOs clear of the MPU (I2C 21/22, INT 4), flash, strapping and
 // input-only pins. Signal wire only; power servos from a separate 5-6V supply
@@ -64,33 +44,40 @@ Servo servos[NUM_SERVOS];
 int   servoPos[NUM_SERVOS] = {90, 90};   // last commanded angle; echoed in telemetry
 
 MPU6050 mpu;
+BluetoothSerial SerialBT;
+
+// --- Wi-Fi video state (provisioned over Bluetooth) ---
+WiFiUDP   videoUdp;
+String    wifiSsid, wifiPass;
+IPAddress laptopIp;
+enum VideoState { VID_IDLE, VID_CONNECTING, VID_STREAMING };
+VideoState    videoState    = VID_IDLE;
+unsigned long lastVideoTime = 0;
+uint32_t      videoSeq      = 0;
 
 // --- DMP state (touched only by setup + the IMU task) ---
 bool     dmpReady   = false;
-uint8_t  devStatus;                  // dmpInitialize() return code (0 = success)
-uint16_t packetSize;                 // expected DMP FIFO packet size
+uint8_t  devStatus;
+uint16_t packetSize;
 uint8_t  fifoBuffer[64];
 
-// --- INT pin -> data-ready flag ---
 volatile bool mpuInterrupt = false;
 void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
 
 // --- Shared latest sample, written by the IMU task, read by loop() ---
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
-volatile float    sQ[4]     = {1, 0, 0, 0};   // w, x, y, z
+volatile float    sQ[4]     = {1, 0, 0, 0};
 volatile int16_t  sAccel[3] = {0, 0, 0};
 volatile int16_t  sGyro[3]  = {0, 0, 0};
-volatile uint32_t sSeq      = 0;               // bumped on every fresh sample
+volatile uint32_t sSeq      = 0;
 
 TaskHandle_t imuTaskHandle = NULL;
-
 unsigned long previousTime = 0;
 uint32_t      lastSentSeq  = 0;
 
 
 // ---------------------------------------------------------------------------
 // IMU task: drain the DMP FIFO and publish the newest quaternion + raw counts.
-// Pinned to core 0 so it never waits behind the TX/radio work on core 1.
 // ---------------------------------------------------------------------------
 void imuTask(void *param) {
   Quaternion   q;
@@ -101,7 +88,7 @@ void imuTask(void *param) {
     if (!dmpReady) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
     if (!mpuInterrupt && mpu.getFIFOCount() < packetSize) {
-      vTaskDelay(1);                 // nothing ready yet -> yield the core
+      vTaskDelay(1);
       continue;
     }
     mpuInterrupt = false;
@@ -109,13 +96,12 @@ void imuTask(void *param) {
     uint8_t  intStatus = mpu.getIntStatus();
     uint16_t fifoCount = mpu.getFIFOCount();
 
-    // Overflow: the documented stale/garbage-quaternion failure mode. Resync.
-    if ((intStatus & 0x10) || fifoCount >= 1024) {
+    if ((intStatus & 0x10) || fifoCount >= 1024) {   // FIFO overflow -> resync
       mpu.resetFIFO();
       continue;
     }
 
-    if (intStatus & 0x02) {          // DMP data ready
+    if (intStatus & 0x02) {
       while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
       mpu.getFIFOBytes(fifoBuffer, packetSize);
 
@@ -135,10 +121,8 @@ void imuTask(void *param) {
 
 
 // ---------------------------------------------------------------------------
-// Transport-agnostic helpers (shared by both links)
+// Bluetooth: sensor telemetry out; commands + provisioning in.
 // ---------------------------------------------------------------------------
-
-// Format one telemetry line into buffer.
 void buildTelemetry(char *buffer, size_t n,
                     const float q[4], const int16_t a[3], const int16_t g[3]) {
   snprintf(buffer, n,
@@ -147,8 +131,6 @@ void buildTelemetry(char *buffer, size_t n,
            servoPos[0], servoPos[1]);
 }
 
-// Apply a comma-separated servo command like "s0:90,s1:45" (clamped 0-180).
-// A non-matching line (e.g. the WiFi "hello") is simply ignored.
 void applyServoCommand(char *buf) {
   for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
     int idx, ang;
@@ -161,111 +143,110 @@ void applyServoCommand(char *buf) {
   }
 }
 
-
-// ---------------------------------------------------------------------------
-// Link layer: one implementation per transport, same four-function contract.
-// ---------------------------------------------------------------------------
-#if USE_BLUETOOTH
-
-void linkBegin() {
-  SerialBT.begin(BT_NAME);
-  Serial.printf("Bluetooth SPP up as \"%s\" - pair from the laptop, then open its COM port\n",
-                BT_NAME);
+// Start (or restart) the Wi-Fi station link for video. args = "ssid|pass|ip".
+void provisionWifi(char *args) {
+  char *ssid = strtok(args, "|");
+  char *pass = strtok(NULL, "|");
+  char *ips  = strtok(NULL, "|");
+  if (!(ssid && pass && ips)) {
+    SerialBT.println("wifi:error,bad-args");
+    return;
+  }
+  if (!laptopIp.fromString(ips)) {
+    SerialBT.println("wifi:error,bad-ip");
+    return;
+  }
+  wifiSsid = ssid;
+  wifiPass = pass;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  videoState = VID_CONNECTING;
+  SerialBT.printf("wifi:connecting,%s\n", wifiSsid.c_str());
+  Serial.printf("Provisioned Wi-Fi '%s', video -> %s:%d\n", wifiSsid.c_str(), ips, VIDEO_PORT);
 }
 
-bool linkConnected() { return SerialBT.hasClient(); }
-
-void linkSend(const float q[4], const int16_t a[3], const int16_t g[3]) {
-  if (!SerialBT.hasClient()) return;   // no paired client -> stay silent
-  char buffer[200];
-  buildTelemetry(buffer, sizeof(buffer), q, a, g);
-  SerialBT.println(buffer);            // newline-delimited line
+void handleBtLine(char *line) {
+  if (strcmp(line, "id?") == 0) {
+    SerialBT.printf("id:lifeos,proto:1,servos:%d\n", NUM_SERVOS);
+  } else if (strncmp(line, "wifi:", 5) == 0) {
+    provisionWifi(line + 5);
+  } else {
+    applyServoCommand(line);
+  }
 }
 
-// Accumulate incoming bytes into lines and apply each complete command.
-void linkPoll() {
-  static char line[128];
+// Accumulate incoming Bluetooth bytes into lines and dispatch each.
+void btPoll() {
+  static char line[200];
   static size_t idx = 0;
   while (SerialBT.available()) {
     char c = (char)SerialBT.read();
     if (c == '\n' || c == '\r') {
-      if (idx > 0) { line[idx] = '\0'; applyServoCommand(line); idx = 0; }
+      if (idx > 0) { line[idx] = '\0'; handleBtLine(line); idx = 0; }
     } else if (idx < sizeof(line) - 1) {
       line[idx++] = c;
     }
   }
 }
 
-#else   // ---- WiFi / UDP ----
-
-void linkBegin() {
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
-  udp.begin(UDP_PORT);
-  cmdUdp.begin(CMD_PORT);            // listen for the PC hello + servo commands
-
-  if (MDNS.begin(MDNS_NAME)) {
-    MDNS.addService("lifeos", "udp", CMD_PORT);
-    Serial.printf("mDNS: %s.local advertising _lifeos._udp on %d\n", MDNS_NAME, CMD_PORT);
-  } else {
-    Serial.println("mDNS start failed");
-  }
-}
-
-bool linkConnected() { return havePc; }
-
-void linkSend(const float q[4], const int16_t a[3], const int16_t g[3]) {
-  if (!havePc) return;               // no PC has connected yet -> stay silent
+void btSendSensor(const float q[4], const int16_t a[3], const int16_t g[3]) {
+  if (!SerialBT.hasClient()) return;
   char buffer[200];
   buildTelemetry(buffer, sizeof(buffer), q, a, g);
-  udp.beginPacket(pcIp, UDP_PORT);
-  udp.write((uint8_t*)buffer, strlen(buffer));
-  udp.endPacket();
+  SerialBT.println(buffer);
 }
 
-// Drain any pending datagram on CMD_PORT: the sender becomes our PC (so
-// telemetry follows the laptop's current IP) and any servo command is applied.
-void linkPoll() {
-  int n = cmdUdp.parsePacket();
-  if (n <= 0) return;
 
-  IPAddress from = cmdUdp.remoteIP();
-  if (!havePc || from != pcIp) {
-    Serial.print("PC connected, streaming telemetry to ");
-    Serial.println(from);
+// ---------------------------------------------------------------------------
+// Wi-Fi video: synthetic frame stream to the provisioned laptop IP.
+// Each packet: "vid:<seq>:" header padded with filler to VIDEO_PKT bytes, so
+// the PC-side test can measure throughput and detect loss via the sequence.
+// ---------------------------------------------------------------------------
+void sendVideoFrame() {
+  static uint8_t buf[VIDEO_PKT];
+  int n = snprintf((char *)buf, VIDEO_PKT, "vid:%u:", videoSeq);
+  if (n < 0) n = 0;
+  if ((size_t)n < VIDEO_PKT) memset(buf + n, 'X', VIDEO_PKT - n);
+  videoUdp.beginPacket(laptopIp, VIDEO_PORT);
+  videoUdp.write(buf, VIDEO_PKT);
+  videoUdp.endPacket();
+  videoSeq++;
+}
+
+void updateWifiVideo() {
+  if (videoState == VID_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      videoState = VID_STREAMING;
+      SerialBT.printf("wifi:connected,%s\n", WiFi.localIP().toString().c_str());
+      Serial.print("Wi-Fi connected as "); Serial.print(WiFi.localIP());
+      Serial.print(", streaming video to "); Serial.println(laptopIp);
+    }
+    return;
   }
-  pcIp   = from;
-  havePc = true;
-
-  char buf[128];
-  int len = cmdUdp.read(buf, sizeof(buf) - 1);
-  if (len <= 0) return;
-  buf[len] = '\0';
-  applyServoCommand(buf);
+  if (videoState == VID_STREAMING) {
+    unsigned long now = millis();
+    if (now - lastVideoTime >= videoInterval) {
+      lastVideoTime = now;
+      sendVideoFrame();
+    }
+  }
 }
-
-#endif
 
 
 void setup() {
   Wire.begin();
-  Wire.setClock(400000);             // 400 kHz I2C for prompt FIFO reads
+  Wire.setClock(400000);
   Serial.begin(115200);
 
-  // ESP32Servo shares the LEDC timers; reserve them before attaching.
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   for (int i = 0; i < NUM_SERVOS; i++) {
-    servos[i].setPeriodHertz(50);              // standard 50 Hz servo frame
-    servos[i].attach(SERVO_PINS[i], 500, 2400); // 0.5-2.4 ms pulse range
-    servos[i].write(servoPos[i]);              // park at center on boot
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(SERVO_PINS[i], 500, 2400);
+    servos[i].write(servoPos[i]);
   }
 
   mpu.initialize();
@@ -274,7 +255,6 @@ void setup() {
 
   devStatus = mpu.dmpInitialize();
   if (devStatus == 0) {
-    // Calibrate at rest: keep the sensor still and level for a couple seconds.
     mpu.CalibrateAccel(6);
     mpu.CalibrateGyro(6);
     mpu.setDMPEnabled(true);
@@ -283,19 +263,19 @@ void setup() {
     dmpReady = true;
     Serial.println("DMP ready");
   } else {
-    // 1 = initial memory load failed, 2 = DMP config updates failed
     Serial.print("DMP init failed, code "); Serial.println(devStatus);
   }
 
-  linkBegin();                       // bring up the selected transport
+  SerialBT.begin(BT_NAME);
+  Serial.printf("Bluetooth SPP up as \"%s\"; provision Wi-Fi/video over it.\n", BT_NAME);
 
-  // IMU on core 0; loop()/radio run on core 1.
   xTaskCreatePinnedToCore(imuTask, "imuTask", 4096, NULL, 3, &imuTaskHandle, 0);
 }
 
 
 void loop() {
-  linkPoll();                        // apply any pending command every loop
+  btPoll();              // sensor commands + Wi-Fi provisioning
+  updateWifiVideo();     // Wi-Fi connect state machine + video frames
 
   unsigned long currentTime = millis();
   if (currentTime - previousTime < interval) return;
@@ -312,8 +292,8 @@ void loop() {
   seq  = sSeq;
   portEXIT_CRITICAL(&stateMux);
 
-  if (seq == lastSentSeq) return;    // no fresh sample since last TX
+  if (seq == lastSentSeq) return;
   lastSentSeq = seq;
 
-  linkSend(q, a, g);
+  btSendSensor(q, a, g);
 }
