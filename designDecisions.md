@@ -82,9 +82,13 @@ transport-agnostic — they only call `snapshot()` / `is_connected()` /
 `send_servos()`. Switching WiFi↔Bluetooth changes nothing downstream. This is the
 extension point for future transports (cloud relay, §10).
 
-**Constraint:** The ESP32 can't cheaply run all transports at once (Wi-Fi + BT
-together is heavy on RAM/flash and shares the radio), so the firmware picks **one
-transport per build** via `USE_BLUETOOTH`; the PC-side selector is free.
+**Constraint (historical):** Early on the firmware picked **one transport per
+build** via `USE_BLUETOOTH`, because Wi-Fi + BT together is heavy on RAM/flash and
+shares the radio. This was **superseded by §9** — the ESP32 now runs Bluetooth and
+Wi-Fi *concurrently* (BT for sensor/control, Wi-Fi for video), which needs the
+"Huge APP" partition scheme and accepts reduced Wi-Fi throughput under
+coexistence. The PC `Link` abstraction remains, but the Connect tab no longer has
+a transport selector (see §9).
 
 ## 8. Bluetooth Classic SPP as the primary link (over BLE, over Wi-Fi)
 
@@ -114,32 +118,40 @@ app today. Revisit BLE if/when a browser-based client becomes real.
 **Cost:** BT stack is large — Bluetooth builds need a bigger partition scheme
 ("Huge APP" / "Minimal SPIFFS").
 
-## 9. Roadmap: Bluetooth for sensor data, Wi-Fi/UDP for camera data (BT-first sync)
+## 9. Bluetooth for sensor data, Wi-Fi/UDP for video (BT-provisioned) — BUILT
 
-**Planned decision (not yet built):** Keep two channels, chosen by data type:
+Two channels, chosen by data type, running concurrently:
 
-- **Bluetooth (SPP/BLE) — sensor + control data.** IMU quaternion, servo
-  commands/echo. Low bandwidth, latency-tolerant, must be reliable and
-  network-independent. This is the always-on control channel.
-- **Wi-Fi / UDP — camera data (future).** JPEG frames are high-bandwidth and
-  unsuitable for Bluetooth's throughput, so the camera stream rides Wi-Fi UDP.
+- **Bluetooth (SPP) — sensor + control.** IMU quaternion, servo commands/echo,
+  health flags, the `id?` identity reply, and Wi-Fi provisioning. Low bandwidth,
+  reliable, network-independent; the always-on channel the GUI reads from.
+- **Wi-Fi / UDP — video.** High-bandwidth (future camera; synthetic frames for
+  now), streamed to the laptop on `VIDEO_PORT` (5010).
 
-**BT-first bootstrap:** Bluetooth comes up first and is used to **sync/hand off
-the Wi-Fi side** — e.g. exchange/confirm Wi-Fi association and the PC's address,
-and coordinate when to start the UDP camera stream — *before* the high-bandwidth
-Wi-Fi channel is brought up. Bluetooth is the reliable out-of-band control link;
-Wi-Fi is the fat pipe it turns on once both ends agree.
+**BT-provisioned bootstrap (the key mechanism):** the laptop sends
+`wifi:<ssid>|<password>|<laptop_ip>` **over Bluetooth**; the ESP32 then joins
+Wi-Fi (station mode) and streams video UDP to that IP, replying `wifi:connected,
+<esp_ip>` over Bluetooth. Bluetooth is the reliable out-of-band control link that
+brings up the fat Wi-Fi pipe.
 
-**Why this split:** It plays to each medium's strength (BT = reliable low-rate
-control that ignores the network; Wi-Fi = raw bandwidth) and uses the reliable
-channel to make the fragile one come up predictably. It also aligns with the
-dual-core firmware split (§2): the camera/JPEG work sits on core 1 with the Wi-Fi
-TX, while the IMU FIFO stays isolated on core 0.
+**Why station mode + provisioning (not SoftAP):** the user's Wi-Fi *does* carry
+UDP fine; the only real problem was that the laptop's DHCP address changes across
+boots. Sending the laptop's *current* IP over Bluetooth each session fixes that
+directly, keeps the laptop's internet (no SoftAP takeover), and needs no hardcoded
+credentials. SoftAP remains the fallback for networks that truly block P2P (§10).
 
-**Open questions:** camera stream on the same network vs. ESP32 SoftAP for the
-camera only; how the PC consumes two simultaneous channels; whether camera Wi-Fi
-reintroduces the client-isolation problem (may push toward SoftAP-for-camera or a
-cloud relay, §10).
+**Health surfacing:** the BT telemetry line carries `dmp` (DMP producing
+orientation) and `wf` (Wi-Fi video streaming) flags, so the whole system's state
+— including whether the Wi-Fi side is up — is observable from the single BT
+stream (see §12).
+
+**Testing without a camera:** the ESP32 sends synthetic sequence-numbered 1 KB
+UDP packets; `wifi_video_test.py` provisions over BT and measures throughput /
+packet loss.
+
+**Note:** running BT + Wi-Fi together requires the "Huge APP" partition and
+reduces Wi-Fi throughput under radio coexistence (acceptable for the test; revisit
+if real camera bandwidth demands it — see §10 for SoftAP/cloud fallbacks).
 
 ## 10. Distributed-product direction (future)
 
@@ -164,3 +176,19 @@ Connect is first.
 
 **Why:** Connect is the entry point (you must connect before anything else works),
 and even tab widths read better as the app grows.
+
+## 12. Status bar: per-source ✓/✗ from one telemetry stream
+
+**Decision:** A bottom-left status bar with colored boxes — BT (blue), Wi-Fi
+(green), Servo 1 / Servo 2 (red), MPU (yellow) — each showing a tick if that
+source had a live signal in the **last 1 second**, else a cross.
+
+**Why derived from the BT telemetry line:** everything reports over the one
+always-on Bluetooth stream, so a single "fresh within 1s?" check plus a few fields
+covers all sources: BT = stream fresh; MPU = fresh + `dmp:1` + quaternion present;
+Servo 1/2 = fresh + `s0`/`s1` present; Wi-Fi = fresh + `wf:1`. If BT drops, all go
+cross — the honest state (no link ⇒ no knowledge). Hobby servos have no feedback,
+so the servo dots reflect "the ESP32 is reporting that servo's angle," not
+physical servo health. The source color is always shown (the two red servo boxes
+are told apart by their `S1`/`S2` captions); the glyph carries the live/dead
+state. `dmp` defaults to present-and-ok for older firmware that predates the flag.

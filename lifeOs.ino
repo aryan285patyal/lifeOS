@@ -125,10 +125,14 @@ void imuTask(void *param) {
 // ---------------------------------------------------------------------------
 void buildTelemetry(char *buffer, size_t n,
                     const float q[4], const int16_t a[3], const int16_t g[3]) {
+  // dmp = MPU DMP producing orientation; wf = Wi-Fi video streaming. These let
+  // the GUI status bar light the MPU and Wi-Fi indicators truthfully.
   snprintf(buffer, n,
-           "q0:%.4f,q1:%.4f,q2:%.4f,q3:%.4f,ax:%d,ay:%d,az:%d,gx:%d,gy:%d,gz:%d,s0:%d,s1:%d",
+           "q0:%.4f,q1:%.4f,q2:%.4f,q3:%.4f,ax:%d,ay:%d,az:%d,gx:%d,gy:%d,gz:%d,"
+           "s0:%d,s1:%d,dmp:%d,wf:%d",
            q[0], q[1], q[2], q[3], a[0], a[1], a[2], g[0], g[1], g[2],
-           servoPos[0], servoPos[1]);
+           servoPos[0], servoPos[1],
+           dmpReady ? 1 : 0, (videoState == VID_STREAMING) ? 1 : 0);
 }
 
 void applyServoCommand(char *buf) {

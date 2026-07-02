@@ -2,63 +2,52 @@
 
 A small hardware project: an **ESP32 + MPU6050 IMU** streams fused orientation
 (and drives servos) to a PC, which visualizes the motion in 3D and commands the
-servos back. The link is **two-way** and the transport is **swappable** between
-**Bluetooth** and **Wi-Fi**.
+servos back. The ESP32 runs **two channels at once**:
 
 ```
-MPU6050 ──I2C──► ESP32 ──(Bluetooth SPP  or  Wi-Fi/UDP)──► PC (PySide6 GUI)
- servos ◄─PWM──   ▲  ◄───────── servo commands ──────────────┘
+                 ┌──────────────── Bluetooth SPP (control) ───────────────┐
+MPU6050 ──I2C──► ESP32   sensor telemetry + servo echo  ──►  PC (PySide6 GUI)
+ servos ◄─PWM──   │      ◄── servo commands + Wi-Fi provisioning ──────────┘
+                 └──────────── Wi-Fi/UDP (video, on demand) ──────────────► PC
 ```
 
-The MPU6050's on-chip **DMP** produces a fused orientation **quaternion**; the
-ESP32 forwards that plus raw accel/gyro counts and the current servo angles as
-one ASCII stream. The PC GUI shows a live 3D model, plots the data, and sends
-servo targets; the ESP32 echoes the applied angles so the servo view always
-reflects real device state.
+Bluetooth is the always-on control link (sensor + servos). Once the laptop sends
+its Wi-Fi SSID/password and current IP **over Bluetooth**, the ESP32 joins Wi-Fi
+and streams high-bandwidth **video** by UDP. Sending the laptop's IP each session
+means a changing DHCP address never breaks the link, and nothing is hardcoded.
+(No camera yet — a synthetic frame stream tests the Wi-Fi path.)
 
-## Wire protocol (same on every transport)
+## Wire protocol
 
-One line per sample (~50 Hz):
+**Sensor telemetry (Bluetooth), one line per sample (~50 Hz):**
 
 ```
-q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,s0:<i>,s1:<i>
+q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,s0:<i>,s1:<i>,dmp:<i>,wf:<i>
 ```
 
-- `q0..q3` — fused DMP quaternion (w, x, y, z), floats.
-- `ax..gz` — raw accel/gyro counts (converted to g / °/s on the PC).
-- `s0..s1` — servo angles the ESP32 currently holds (echoed back).
+- `q0..q3` — fused DMP quaternion (w, x, y, z).
+- `ax..gz` — raw accel/gyro counts (converted on the PC).
+- `s0..s1` — servo angles the ESP32 holds (echoed back).
+- `dmp` — DMP producing orientation (1/0); `wf` — Wi-Fi video streaming (1/0).
+  These drive the MPU and Wi-Fi status indicators.
 
-Commands PC→ESP32 use the same form: `s0:90,s1:45`.
+**Control PC→ESP32 (Bluetooth):** `s0:90,s1:45` (servo), `id?` → `id:lifeos,...`
+(identity, for COM auto-detect), `wifi:<ssid>|<password>|<laptop_ip>` (provision
+Wi-Fi video).
 
 ## Components
 
 | File | Role |
 | --- | --- |
-| `lifeOs.ino` | ESP32 firmware. MPU6050 DMP + servos, streaming/commands over a swappable link (`USE_BLUETOOTH`). |
-| `gui.py` | PySide6 app: **Connect**, **Monitor**, **Visualizer**, **Servos** tabs, with a Bluetooth/Wi-Fi transport selector. |
-| `CleanInput.py` | Cleans the packet stream and converts raw counts to physical units. |
+| `lifeOs.ino` | ESP32 firmware. MPU6050 DMP + servos, Bluetooth sensor/control link, Wi-Fi video on demand. |
+| `gui.py` | PySide6 app: Connect / Monitor / Visualizer / Servos tabs + status bar. |
+| `CleanInput.py` | Cleans the packet stream, converts raw counts to physical units. |
 | `live_charts.py` | Scrolling Qt charts for the Monitor tab. |
-| `web/` | Vendored three.js scene for the Visualizer (`index.html`, `main.js`, `hand_model.js`, + vendored libs). |
-| `reciever.py` | Minimal terminal receiver for Wi-Fi/UDP mode. |
-| `bt_receiver.py` | Minimal terminal receiver for the Bluetooth link. |
-| `secrets.example.h` | Template for Wi-Fi credentials (copy to `secrets.h`, gitignored). |
-| `designDecisions.md` | Why the architecture is the way it is (transports, protocol, servos, roadmap). |
-
-## Transports
-
-Set at the top of `lifeOs.ino`:
-
-- **`#define USE_BLUETOOTH 1`** (default) — **Bluetooth Classic SPP**. The ESP32
-  pairs as `lifeos` and shows up as a COM port. Keeps the laptop's Wi-Fi/internet
-  free and ignores the local network entirely — the reliable choice on managed /
-  isolated Wi-Fi (apartment, campus, corporate).
-- **`#define USE_BLUETOOTH 0`** — **Wi-Fi / UDP** with mDNS discovery
-  (`lifeos.local` / `_lifeos._udp`). The PC discovers the device (or connects by
-  IP), sends a `hello`, and the ESP32 learns the PC's IP from it (nothing
-  hardcoded). Requires a network that allows peer-to-peer traffic; many managed
-  networks block it (symptom: ping works but UDP never arrives).
-
-The GUI's Connect tab lets you pick either transport at runtime.
+| `web/` | Vendored three.js scene for the Visualizer. |
+| `bt_receiver.py` | Minimal terminal receiver for the Bluetooth sensor link. |
+| `wifi_video_test.py` | Provisions Wi-Fi over Bluetooth and measures the video UDP stream. |
+| `reciever.py` | Legacy terminal receiver for the old Wi-Fi/UDP sensor mode. |
+| `designDecisions.md` | Why the architecture is the way it is. |
 
 ## Hardware / wiring (ESP-WROOM-32)
 
@@ -72,25 +61,22 @@ The GUI's Connect tab lets you pick either transport at runtime.
 | Servo 0 signal | GPIO13 |
 | Servo 1 signal | GPIO25 |
 
-Power servos from an **external 5–6V supply** (not the ESP32), with its **ground
-tied to the ESP32 ground**. Add a bulk cap (470–1000 µF) across the servo rail to
-prevent current spikes browning out the board. The `INT` wire is required (the
-firmware drains the DMP FIFO on it).
+Power servos from an **external 5–6V supply** (not the ESP32), ground tied to the
+ESP32 ground; add a 470–1000 µF bulk cap across the servo rail to prevent current
+spikes browning out the board. The `INT` wire is required (the firmware drains the
+DMP FIFO on it).
 
 ## Firmware setup
 
 1. Open `lifeOs.ino` in the Arduino IDE / arduino-cli with the **ESP32 board
    package**.
-2. Install libraries: **"MPU6050" by Electronic Cats** (bundles I2Cdev +
-   MPU6050_6Axis_MotionApps20) and **"ESP32Servo"**. `WiFi`/`ESPmDNS`/
-   `BluetoothSerial` ship with the core.
-3. Pick a transport with `USE_BLUETOOTH`. For **Bluetooth**, set **Tools →
-   Partition Scheme → "Huge APP"** (or "Minimal SPIFFS") — the BT stack + DMP
-   blob overflow the default partition.
-4. For **Wi-Fi** mode: `cp secrets.example.h secrets.h` and set `WIFI_SSID` /
-   `WIFI_PASSWORD` (Bluetooth mode needs no secrets; `PC_IP` is no longer used).
-5. Upload. Open the serial monitor at **115200**; keep the sensor still for ~2 s
-   on boot (DMP calibration).
+2. Install **"MPU6050" by Electronic Cats** + **"ESP32Servo"**
+   (WiFi/WiFiUdp/BluetoothSerial ship with the core).
+3. **Set Tools → Partition Scheme → "Huge APP"** (or "Minimal SPIFFS") — Bluetooth
+   **+** Wi-Fi **+** the DMP blob overflow the default partition.
+4. Upload. Open the serial monitor at **115200**; keep the sensor still ~2 s on
+   boot (DMP calibration). No Wi-Fi credentials are needed at build time — they
+   arrive over Bluetooth from the GUI.
 
 ## PC setup
 
@@ -101,22 +87,32 @@ pip install -r requirements.txt   # PySide6 (pinned 6.8.0.2), zeroconf, pyserial
 python gui.py
 ```
 
-- **Connect** — choose Bluetooth (pick the paired `lifeos` COM port) or Wi-Fi
-  (mDNS list or manual IP/`lifeos.local`); "Make this my default" auto-connects
-  next launch.
+- **Connect** — two sections. *Bluetooth (sensor & servos)*: pick the paired
+  `lifeos` COM port (**Find lifeOs port** auto-detects it), Connect, Save default.
+  *Wi-Fi (video)*: enter SSID/password, confirm the auto-filled laptop IP,
+  Connect (creds sent over Bluetooth), Save default.
 - **Monitor** — connection status, raw/converted table, live charts, Reset /
-  Recalibrate, and (Wi-Fi) a UDP port diagnostics helper.
+  Recalibrate.
 - **Visualizer** — a 3D model that rotates with the device; **Zero / Level**
-  cancels the resting pose. Rendered with three.js in a `QWebEngineView`.
-- **Servos** — sliders/spinboxes to set angles + read-only dials that follow the
-  **echoed** angles (true device state).
+  cancels the resting pose (three.js in a `QWebEngineView`).
+- **Servos** — sliders/spinboxes to set angles + dials that follow the echoed
+  angles (true device state).
+- **Status bar (bottom-left)** — colored ✓/✗ boxes for **BT** (blue), **WiFi**
+  (green), **S1/S2** (red), **MPU** (yellow), live if that source had a signal in
+  the last second.
 
-Quick link checks without the GUI: `python reciever.py` (Wi-Fi) or
-`python bt_receiver.py [COMx]` (Bluetooth — pair `lifeos` first).
+Verify the Wi-Fi video path:
+```bash
+python wifi_video_test.py --com COM7 --ssid MyWifi --password secret
+# or, if already provisioned via the GUI:
+python wifi_video_test.py
+```
+(Allow inbound **UDP 5010** in the firewall if you see zero packets.)
 
 ## Notes
 
 - Yaw drifts slowly (no magnetometer); roll/pitch are stable. Use Zero / Level.
-- PC-side tools target Windows (`netstat`/`tasklist` diagnostics; `reciever.py`
-  uses `msvcrt`).
-- See `CLAUDE.md` for the working reference and `designDecisions.md` for rationale.
+- BT + Wi-Fi share one radio, so Wi-Fi throughput is lower than Wi-Fi alone.
+- The saved Wi-Fi password sits in `connect_config.json` (gitignored, plaintext).
+- PC-side tools target Windows. See `CLAUDE.md` for the working reference and
+  `designDecisions.md` for rationale.

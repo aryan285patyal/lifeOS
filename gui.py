@@ -814,6 +814,30 @@ class ConnectTab(QWidget):
             self.connect_video()
 
 
+class StatusDot(QLabel):
+    """A small colored box in the status bar. Its source color is fixed (so you
+    can always tell which is which); a tick (live) or cross (no signal in the
+    last second) shows the state."""
+
+    def __init__(self, name, color):
+        super().__init__()
+        self.name = name
+        self.color = color
+        self.setFixedSize(30, 20)
+        self.setAlignment(Qt.AlignCenter)
+        font = self.font()
+        font.setBold(True)
+        self.setFont(font)
+        self.set_live(False)
+
+    def set_live(self, live):
+        self.setText("✓" if live else "✗")   # tick / cross
+        self.setStyleSheet(
+            f"background-color: {self.color}; color: white; "
+            f"border-radius: 3px; border: 1px solid #222;")
+        self.setToolTip(f"{self.name}: {'live' if live else 'no signal (>1s)'}")
+
+
 class MonitorWindow(QMainWindow):
     def __init__(self, listener):
         super().__init__()
@@ -892,9 +916,36 @@ class MonitorWindow(QMainWindow):
         tabs.addTab(self.servos, "Servos")
         self.setCentralWidget(tabs)
 
+        self._build_status_bar()
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh)
         self.timer.start(100)
+
+    def _build_status_bar(self):
+        """Bottom-left indicators, one colored box per source, tick/cross by
+        whether we've had a live signal in the last second."""
+        bar = self.statusBar()
+        self.dot_bt = StatusDot("Bluetooth", "#1565c0")   # blue
+        self.dot_wifi = StatusDot("Wi-Fi", "#2e7d32")     # green
+        self.dot_s1 = StatusDot("Servo 1", "#c62828")     # red
+        self.dot_s2 = StatusDot("Servo 2", "#c62828")     # red
+        self.dot_mpu = StatusDot("MPU", "#f9a825")        # yellow
+        for caption, dot in [("BT", self.dot_bt), ("WiFi", self.dot_wifi),
+                             ("S1", self.dot_s1), ("S2", self.dot_s2), ("MPU", self.dot_mpu)]:
+            bar.addWidget(QLabel(caption))
+            bar.addWidget(dot)
+
+    def _update_status_dots(self, values, connected):
+        # Everything is reported over the (Bluetooth) telemetry stream, so all
+        # dots are cross when it isn't fresh. `connected` == signal within 1s.
+        is_bt = isinstance(getattr(self.listener, "active", None), BluetoothLink)
+        self.dot_bt.set_live(connected and is_bt)
+        self.dot_wifi.set_live(connected and int(values.get("wf", 0)) == 1)
+        self.dot_s1.set_live(connected and "s0" in values)
+        self.dot_s2.set_live(connected and "s1" in values)
+        # dmp defaults to 1 for older firmware that doesn't send the field
+        self.dot_mpu.set_live(connected and "q0" in values and int(values.get("dmp", 1)) == 1)
 
     def start_calibration(self):
         """Begin averaging the next CALIB_SAMPLES fresh packets into a new zero baseline."""
@@ -905,7 +956,8 @@ class MonitorWindow(QMainWindow):
         self.calib_status_label.setText("Calibrating... hold the sensor still")
 
     def refresh(self):
-        if self.listener.is_connected():
+        connected = self.listener.is_connected()
+        if connected:
             self.status_label.setText("Connected")
             self.status_label.setStyleSheet("background-color: #2e7d32; color: white; padding: 8px;")
         else:
@@ -913,6 +965,7 @@ class MonitorWindow(QMainWindow):
             self.status_label.setStyleSheet("background-color: #c62828; color: white; padding: 8px;")
 
         values, last_seen = self.listener.snapshot()
+        self._update_status_dots(values, connected)   # from the raw snapshot (all fields)
         have_full = bool(values) and all(name in values for name in SENSORS)
 
         # recalibration: accumulate only fresh, complete packets, then lock in offsets
