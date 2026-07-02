@@ -66,6 +66,10 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,s0:<i>,s1:
   - Saved defaults auto-connect BT and auto-provision video on launch.
 - **Monitor / Visualizer / Servos** — read through a `ConnectionManager` and are
   transport-agnostic.
+- **Hand Model tab** — dropdown of the PC's video input devices (via
+  QtMultimedia `QMediaDevices`); Apply streams the selected camera into a small
+  preview box (`QCamera` → `QMediaCaptureSession` → `QVideoWidget`). Planned:
+  the ESP32's Wi-Fi UDP video as another selectable source, then hand tracking.
 - **Status bar (bottom-left)** — colored `StatusDot` boxes (BT blue, Wi-Fi green,
   Servo1/Servo2 red, MPU yellow) showing ✓/✗ by whether that source had a live
   signal in the last second (all derived from the fresh BT telemetry line).
