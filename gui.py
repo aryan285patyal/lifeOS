@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QLineEdit, QPushButton, QTabWidget, QTabBar, QSlider, QSpinBox, QDial,
-    QGroupBox, QListWidget, QListWidgetItem, QCheckBox,
+    QGroupBox, QListWidget, QListWidgetItem, QCheckBox, QComboBox, QStackedWidget,
 )
 from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal
 from PySide6.QtGui import QColor
@@ -28,6 +28,7 @@ SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
 NUM_SERVOS = 2                        # must match NUM_SERVOS in lifeOs.ino
 SERVO_GPIOS = [13, 25]               # for display only; matches SERVO_PINS in firmware
 SERVO_KEYS = [f"s{i}" for i in range(NUM_SERVOS)]  # echoed angle fields in telemetry
+UDP_PORT = 5005                       # telemetry port (WiFi mode); matches UDP_PORT in lifeOs.ino
 CMD_PORT = 5006                       # must match CMD_PORT in lifeOs.ino
 
 # mDNS service the ESP32 advertises (MDNS.addService("lifeos", "udp", ...)).
@@ -55,6 +56,15 @@ def save_connect_config(cfg):
 def looks_like_ip(s):
     parts = s.split('.')
     return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
+def list_serial_ports():
+    """[(device, description)] of COM ports, or [] if pyserial isn't installed."""
+    try:
+        import serial.tools.list_ports as lp
+    except Exception:
+        return []
+    return [(p.device, p.description) for p in lp.comports()]
 
 CALIB_SAMPLES = 20          # fresh samples averaged into the zero baseline on reset
 
@@ -102,38 +112,34 @@ def find_port_users(port):
         return []
 
 
-class Listener:
-    def __init__(self, port=5005):
+def parse_line(text):
+    """Parse one 'q0:..,ax:..,s0:..' telemetry line into a dict. q* fields are
+    floats, everything else int. Raises on malformed input."""
+    d = {}
+    for pair in text.split(','):
+        key, value = pair.split(':')
+        d[key] = float(value) if key.startswith('q') else int(value)
+    return d
+
+
+class Link:
+    """Base transport: shared parsed-sample state + read-side accessors. Both
+    transports carry the same newline/packet ASCII protocol, so only the byte
+    source differs. Subclasses implement start/stop/send_servos/description."""
+
+    def __init__(self):
         self.lock = threading.Lock()
         self.latest = {}
         self.last_seen = 0.0
-        self.port = port
-        self.peer_ip = None                      # ESP32 IP, learned from packets
-        # dedicated TX socket for the reverse (PC -> ESP32) command channel
-        self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    def start(self):
-        thread = threading.Thread(target=self._run)
-        thread.daemon = True
-        thread.start()
-
-    def _run(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.bind(('', self.port))
-            while True:
-                data, addr = sock.recvfrom(1024)
-                try:
-                    parsed_data = {}
-                    for pair in data.decode().split(','):
-                        key, value = pair.split(':')
-                        # quaternion fields (q0..q3) are floats; everything else int
-                        parsed_data[key] = float(value) if key.startswith('q') else int(value)
-                    with self.lock:
-                        self.latest = parsed_data
-                        self.last_seen = time.monotonic()
-                        self.peer_ip = addr[0]   # remember who to send commands to
-                except Exception:
-                    continue
+    def _ingest(self, text):
+        try:
+            d = parse_line(text)
+        except Exception:
+            return
+        with self.lock:
+            self.latest = d
+            self.last_seen = time.monotonic()
 
     def snapshot(self):
         with self.lock:
@@ -143,10 +149,63 @@ class Listener:
         with self.lock:
             return (time.monotonic() - self.last_seen) <= timeout
 
+    # --- overridden per transport ---
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_servos(self, angles):
+        return False
+
+    def description(self):
+        return "?"
+
+
+class WifiLink(Link):
+    """UDP telemetry in (port UDP_PORT) + commands out (CMD_PORT). Learns the
+    ESP32 IP from incoming packets; the Connect tab also sets it via
+    register_peer(), which sends the 'hello' that starts the stream."""
+
+    def __init__(self, port=UDP_PORT):
+        super().__init__()
+        self.port = port
+        self.peer_ip = None
+        self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._running = False
+
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('', self.port))
+        except OSError:
+            self._running = False
+            return
+        sock.settimeout(0.5)                     # so stop() is honored promptly
+        while self._running:
+            try:
+                data, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self._ingest(data.decode(errors="ignore"))
+            with self.lock:
+                self.peer_ip = addr[0]
+        sock.close()
+
+    def stop(self):
+        self._running = False
+
     def register_peer(self, ip):
-        """Point telemetry at this ESP32: remember its IP and send a 'hello' to
-        CMD_PORT so the firmware learns our IP and starts streaming. Called by
-        the Connect tab after mDNS discovery. Returns True if the hello was sent."""
+        """Remember the ESP32 IP and send 'hello' so the firmware learns our IP
+        and starts streaming. Returns True if the datagram was sent."""
         with self.lock:
             self.peer_ip = ip
         try:
@@ -156,9 +215,6 @@ class Listener:
             return False
 
     def send_servos(self, angles):
-        """Send target angles to the ESP32 as 's0:NN,s1:NN'. Returns True if a
-        peer IP is known (i.e. we've heard from the device) and the datagram was
-        sent, else False."""
         with self.lock:
             ip = self.peer_ip
         if not ip:
@@ -169,6 +225,91 @@ class Listener:
             return True
         except OSError:
             return False
+
+    def description(self):
+        with self.lock:
+            ip = self.peer_ip
+        return f"Wi-Fi {ip}" if ip else "Wi-Fi (no device)"
+
+
+class BluetoothLink(Link):
+    """Bluetooth Classic SPP over a paired COM port. Same ASCII protocol as
+    WiFi, one newline-delimited line per sample. pyserial is imported lazily so
+    the GUI still runs without it when only WiFi is used."""
+
+    def __init__(self, com):
+        super().__init__()
+        self.com = com
+        self.ser = None
+        self._running = False
+
+    def start(self):
+        import serial                            # lazy: only needed for Bluetooth
+        self.ser = serial.Serial(self.com, 115200, timeout=1)
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import serial
+        while self._running:
+            try:
+                raw = self.ser.readline()
+            except (serial.SerialException, OSError):
+                break
+            if raw:
+                self._ingest(raw.decode(errors="ignore").strip())
+
+    def stop(self):
+        self._running = False
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+    def send_servos(self, angles):
+        if not self.ser:
+            return False
+        msg = ",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)) + "\n"
+        try:
+            self.ser.write(msg.encode())
+            return True
+        except Exception:
+            return False
+
+    def description(self):
+        return f"Bluetooth {self.com}"
+
+
+class ConnectionManager:
+    """Holds the active Link and proxies the read/write API the tabs use, so the
+    Monitor/Visualizer/Servos tabs stay transport-agnostic. Activating a new
+    link stops the previous one (freeing its socket / COM port)."""
+
+    def __init__(self):
+        self.active = None
+
+    def set_active(self, link):
+        old = self.active
+        self.active = link
+        if old is not None and old is not link:
+            old.stop()
+
+    def snapshot(self):
+        return self.active.snapshot() if self.active else ({}, 0.0)
+
+    def is_connected(self, timeout=1.0):
+        return self.active.is_connected(timeout) if self.active else False
+
+    def send_servos(self, angles):
+        return self.active.send_servos(angles) if self.active else False
+
+    def description(self):
+        return self.active.description() if self.active else "Not connected"
+
+    def close(self):
+        if self.active:
+            self.active.stop()
 
 
 class StretchTabBar(QTabBar):
@@ -357,17 +498,13 @@ class ServoTab(QWidget):
                 "Sent " + ", ".join(f"S{i}={a} deg" for i, a in enumerate(angles)))
         else:
             self.sent_label.setText(
-                "Cannot send yet - no packet received from the ESP32 (its IP is unknown).")
+                "Cannot send - not connected. Use the Connect tab first.")
 
     def _refresh(self):
-        connected = self.listener.is_connected()
-        peer = self.listener.peer_ip
-        if connected and peer:
-            self.status_label.setText(f"ESP32 at {peer} - commands on port {CMD_PORT}")
-        elif peer:
-            self.status_label.setText(f"Last seen ESP32 at {peer} (no recent packets)")
+        if self.listener.is_connected():
+            self.status_label.setText(f"Connected via {self.listener.description()}")
         else:
-            self.status_label.setText("Waiting for the ESP32 to announce itself...")
+            self.status_label.setText("Not connected - use the Connect tab.")
 
         values, _ = self.listener.snapshot()
         for i, key in enumerate(SERVO_KEYS):
@@ -380,22 +517,24 @@ class ServoTab(QWidget):
 
 
 class ConnectTab(QWidget):
-    """Discover the ESP32 over mDNS and connect to it.
+    """Pick a transport (Bluetooth or Wi-Fi) and connect to the ESP32.
 
-    Discovery is mDNS-only (the ESP32 advertises _lifeos._udp on boot). Pressing
-    Connect sends a 'hello' to the device; from then on the link is plain UDP at
-    the full telemetry rate, with servo data echoed back. A remembered default
-    device auto-connects as soon as it appears on the network."""
+    Bluetooth: lists paired COM ports; Connect opens the port and streams over
+    SPP -- network-independent, keeps the laptop's internet free.
+    Wi-Fi: mDNS device list + a manual IP/hostname fallback; Connect sends a
+    'hello' that starts the two-way UDP stream.
+    Either way the chosen link is handed to the ConnectionManager, so the other
+    tabs are unaffected. A remembered default auto-connects on launch."""
 
-    def __init__(self, listener, discovery):
+    def __init__(self, manager, discovery):
         super().__init__()
-        self.listener = listener
+        self.manager = manager
         self.discovery = discovery
         self.config = load_connect_config()
-        self._rows = []            # row index -> (service_name, ip, port)
+        self._wifi_rows = []       # row -> (service_name, ip, port)
+        self._bt_rows = []         # row -> (com_device, description)
         self._last_keys = None
         self._auto_attempted = False
-        self._target_ip = None
 
         root = QVBoxLayout(self)
 
@@ -411,74 +550,121 @@ class ConnectTab(QWidget):
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
 
-        self.device_list = QListWidget()
-        root.addWidget(self.device_list, 1)
-        self.device_list.itemDoubleClicked.connect(lambda _: self.connect_selected())
+        # transport selector -> switches the panel below
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("Transport:"))
+        self.transport = QComboBox()
+        self.transport.addItem("Bluetooth (SPP)", "bluetooth")   # index 0
+        self.transport.addItem("Wi-Fi (UDP)", "wifi")            # index 1
+        self.transport.currentIndexChanged.connect(self.stack_index_changed)
+        trow.addWidget(self.transport, 1)
+        root.addLayout(trow)
 
-        btn_row = QHBoxLayout()
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_bt_page())    # index 0
+        self.stack.addWidget(self._build_wifi_page())  # index 1
+        root.addWidget(self.stack, 1)
+
+        self.default_chk = QCheckBox("Make this my default connection")
+        self.default_chk.setChecked(bool(self.config.get("default_transport")))
+        root.addWidget(self.default_chk)
+
+        # restore the last-used transport
+        want = self.config.get("default_transport", "bluetooth")
+        idx = 1 if want == "wifi" else 0
+        self.transport.setCurrentIndex(idx)
+        self.stack.setCurrentIndex(idx)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(1000)
+        self.refresh_wifi()
+        self.refresh_bt()
+
+    def stack_index_changed(self, idx):
+        self.stack.setCurrentIndex(idx)
+
+    # --- page builders ---
+    def _build_bt_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addWidget(QLabel("Paired Bluetooth COM ports:"))
+        self.bt_list = QListWidget()
+        self.bt_list.itemDoubleClicked.connect(lambda _: self.connect_bt())
+        v.addWidget(self.bt_list, 1)
+        row = QHBoxLayout()
+        self.bt_refresh_btn = QPushButton("Refresh ports")
+        self.bt_refresh_btn.clicked.connect(self.refresh_bt)
+        self.bt_connect_btn = QPushButton("Connect")
+        self.bt_connect_btn.clicked.connect(self.connect_bt)
+        row.addWidget(self.bt_refresh_btn)
+        row.addWidget(self.bt_connect_btn)
+        v.addLayout(row)
+        v.addWidget(QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth settings first."))
+        return page
+
+    def _build_wifi_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addWidget(QLabel("Discovered lifeOs devices (mDNS):"))
+        self.device_list = QListWidget()
+        self.device_list.itemDoubleClicked.connect(lambda _: self.connect_selected())
+        v.addWidget(self.device_list, 1)
+        row = QHBoxLayout()
         self.refresh_btn = QPushButton("Refresh devices")
-        self.refresh_btn.clicked.connect(self.refresh)
+        self.refresh_btn.clicked.connect(self.refresh_wifi)
         self.connect_btn = QPushButton("Connect to selected")
         self.connect_btn.clicked.connect(self.connect_selected)
-        btn_row.addWidget(self.refresh_btn)
-        btn_row.addWidget(self.connect_btn)
-        root.addLayout(btn_row)
-
-        # Manual fallback: connect straight to an IP / hostname (read off the
-        # serial monitor) when mDNS browsing can't see the device -- e.g. the
-        # Windows firewall is dropping multicast, or a virtual adapter is in the
-        # way. Same hello->UDP path as a discovered device.
-        manual_row = QHBoxLayout()
-        manual_row.addWidget(QLabel("Or connect directly:"))
+        row.addWidget(self.refresh_btn)
+        row.addWidget(self.connect_btn)
+        v.addLayout(row)
+        manual = QHBoxLayout()
+        manual.addWidget(QLabel("Or connect directly:"))
         self.manual_edit = QLineEdit()
         self.manual_edit.setPlaceholderText("172.16.72.32  or  lifeos.local")
         self.manual_edit.returnPressed.connect(self.connect_manual)
         self.manual_btn = QPushButton("Connect")
         self.manual_btn.clicked.connect(self.connect_manual)
-        manual_row.addWidget(self.manual_edit, 1)
-        manual_row.addWidget(self.manual_btn)
-        root.addLayout(manual_row)
+        manual.addWidget(self.manual_edit, 1)
+        manual.addWidget(self.manual_btn)
+        v.addLayout(manual)
+        return page
 
-        self.default_chk = QCheckBox("Make this my default connection")
-        self.default_chk.setChecked(bool(self.config.get("default_device")))
-        root.addWidget(self.default_chk)
+    # --- Wi-Fi ---
+    def _ensure_wifi_link(self):
+        if not isinstance(self.manager.active, WifiLink):
+            link = WifiLink()
+            link.start()
+            self.manager.set_active(link)   # stops any previous (e.g. Bluetooth)
+        return self.manager.active
 
-        # poll discovery + connection status; also drives one-shot auto-connect
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(1000)
-        self.refresh()
-
-    def _populate(self, devices):
-        # preserve the current selection across rebuilds
+    def _populate_wifi(self, devices):
         prev = None
-        row = self.device_list.currentRow()
-        if 0 <= row < len(self._rows):
-            prev = self._rows[row][0]
-
+        r = self.device_list.currentRow()
+        if 0 <= r < len(self._wifi_rows):
+            prev = self._wifi_rows[r][0]
         self.device_list.clear()
-        self._rows = []
+        self._wifi_rows = []
         for name, (ip, port) in sorted(devices.items()):
             self.device_list.addItem(f"{name.split('.')[0]}    ({ip})")
-            self._rows.append((name, ip, port))
-        if not self._rows:
+            self._wifi_rows.append((name, ip, port))
+        if not self._wifi_rows:
             self.device_list.addItem("(no lifeOs devices found - power on the ESP32, then Refresh)")
-
-        for i, (name, _ip, _port) in enumerate(self._rows):
+        for i, (name, _ip, _p) in enumerate(self._wifi_rows):
             if name == prev:
                 self.device_list.setCurrentRow(i)
                 break
 
-    def refresh(self):
-        self._populate(self.discovery.devices())
+    def refresh_wifi(self):
+        self._populate_wifi(self.discovery.devices())
 
     def connect_selected(self):
-        row = self.device_list.currentRow()
-        if not (0 <= row < len(self._rows)):
+        r = self.device_list.currentRow()
+        if not (0 <= r < len(self._wifi_rows)):
             self.status_label.setText("Select a device from the list first.")
             return
-        name, ip, _port = self._rows[row]
-        self._connect_to(name, ip)
+        name, ip, _p = self._wifi_rows[r]
+        self._connect_wifi(name, ip)
 
     def connect_manual(self):
         text = self.manual_edit.text().strip()
@@ -493,22 +679,64 @@ class ConnectTab(QWidget):
                 self.status_label.setText(
                     f"Could not resolve '{text}'. Type the IP shown on the serial monitor instead.")
                 return
-        self._connect_to(text, ip)
+        self._connect_wifi(text, ip)
 
-    def _connect_to(self, name, ip):
-        self._target_ip = ip
-        ok = self.listener.register_peer(ip)
+    def _connect_wifi(self, name, ip):
+        link = self._ensure_wifi_link()
+        ok = link.register_peer(ip)
         label = name.split('.')[0]
-        if ok:
-            self.status_label.setText(f"Sent hello to {label} ({ip}) - waiting for telemetry...")
-        else:
-            self.status_label.setText(f"Could not reach {label} ({ip}).")
+        self.status_label.setText(
+            f"Sent hello to {label} ({ip}) - waiting for telemetry..." if ok
+            else f"Could not reach {label} ({ip}).")
+        self._save_default("wifi", name)
 
-        # persist / clear the default per the checkbox
+    # --- Bluetooth ---
+    def _populate_bt(self):
+        prev = None
+        r = self.bt_list.currentRow()
+        if 0 <= r < len(self._bt_rows):
+            prev = self._bt_rows[r][0]
+        self.bt_list.clear()
+        self._bt_rows = []
+        for dev, desc in list_serial_ports():
+            self.bt_list.addItem(f"{dev}    {desc}")
+            self._bt_rows.append((dev, desc))
+        if not self._bt_rows:
+            self.bt_list.addItem("(no COM ports - pair the ESP32 first, or install pyserial)")
+        for i, (dev, _d) in enumerate(self._bt_rows):
+            if dev == prev:
+                self.bt_list.setCurrentRow(i)
+                break
+
+    def refresh_bt(self):
+        self._populate_bt()
+
+    def connect_bt(self):
+        r = self.bt_list.currentRow()
+        if not (0 <= r < len(self._bt_rows)):
+            self.status_label.setText("Select a COM port first (or Refresh ports).")
+            return
+        dev, _desc = self._bt_rows[r]
+        self._connect_bt(dev)
+
+    def _connect_bt(self, com):
+        try:
+            link = BluetoothLink(com)
+            link.start()                        # opens the serial port; may raise
+        except Exception as e:
+            self.status_label.setText(f"Could not open {com}: {e}")
+            return
+        self.manager.set_active(link)           # stops any previous (e.g. Wi-Fi)
+        self.status_label.setText(f"Opened {com} - waiting for telemetry...")
+        self._save_default("bluetooth", com)
+
+    # --- shared ---
+    def _save_default(self, transport, target):
         if self.default_chk.isChecked():
-            self.config["default_device"] = name
-        elif self.config.get("default_device") == name:
-            self.config.pop("default_device", None)
+            self.config["default_transport"] = transport
+            self.config["wifi_target" if transport == "wifi" else "bt_port"] = target
+        elif self.config.get("default_transport") == transport:
+            self.config.pop("default_transport", None)
         save_connect_config(self.config)
 
     def _tick(self):
@@ -516,33 +744,43 @@ class ConnectTab(QWidget):
         keys = tuple(sorted(devices))
         if keys != self._last_keys:
             self._last_keys = keys
-            self._populate(devices)
+            self._populate_wifi(devices)
 
-        if self.listener.is_connected():
-            self.status_label.setText(
-                f"Connected - receiving telemetry from {self.listener.peer_ip}")
+        if self.manager.is_connected():
+            self.status_label.setText(f"Connected - {self.manager.description()}")
             self.status_label.setStyleSheet("color: #2e7d32;")
-        elif self._target_ip:
-            self.status_label.setStyleSheet("color: #c62828;")
 
-        # auto-connect the remembered default, once
-        default = self.config.get("default_device")
-        if default and not self._auto_attempted:
-            if default in devices:                       # a discovered mDNS device
+        self._auto_connect(devices)
+
+    def _auto_connect(self, devices):
+        if self._auto_attempted:
+            return
+        transport = self.config.get("default_transport")
+        if transport == "bluetooth":
+            com = self.config.get("bt_port")
+            if com and any(dev == com for dev, _ in list_serial_ports()):
                 self._auto_attempted = True
                 self.default_chk.setChecked(True)
-                self._connect_to(default, devices[default][0])
-            elif not default.endswith(SERVICE_TYPE):     # a saved manual IP / hostname
+                self._connect_bt(com)
+        elif transport == "wifi":
+            target = self.config.get("wifi_target")
+            if not target:
+                return
+            if target in devices:                        # a discovered mDNS device
                 self._auto_attempted = True
                 self.default_chk.setChecked(True)
-                ip = default if looks_like_ip(default) else None
+                self._connect_wifi(target, devices[target][0])
+            elif not target.endswith(SERVICE_TYPE):      # a saved manual IP / hostname
+                ip = target if looks_like_ip(target) else None
                 if ip is None:
                     try:
-                        ip = socket.gethostbyname(default)
+                        ip = socket.gethostbyname(target)
                     except OSError:
                         ip = None
                 if ip:
-                    self._connect_to(default, ip)
+                    self._auto_attempted = True
+                    self.default_chk.setChecked(True)
+                    self._connect_wifi(target, ip)
 
 
 class MonitorWindow(QMainWindow):
@@ -591,8 +829,8 @@ class MonitorWindow(QMainWindow):
         self.charts = ChartPanel()
         layout.addWidget(self.charts)
 
-        # --- Port diagnostics ---
-        self.check_btn = QPushButton(f"Refresh / Check Port {listener.port}")
+        # --- Port diagnostics (Wi-Fi mode) ---
+        self.check_btn = QPushButton(f"Refresh / Check Port {UDP_PORT}")
         self.check_btn.clicked.connect(self.check_port)
         layout.addWidget(self.check_btn)
 
@@ -684,7 +922,7 @@ class MonitorWindow(QMainWindow):
             self.charts.add_sample(sample.converted)
 
     def check_port(self):
-        port = self.listener.port
+        port = UDP_PORT
         users = find_port_users(port)
         me = os.getpid()
 
@@ -711,6 +949,10 @@ class MonitorWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self.listener.close()    # stop the active link (socket / COM port)
+        except Exception:
+            pass
+        try:
             self.discovery.close()   # stop the zeroconf browser threads cleanly
         except Exception:
             pass
@@ -721,9 +963,8 @@ def main():
     # QtWebEngine wants shared GL contexts set before the QApplication exists.
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
-    listener = Listener()
-    listener.start()
-    win = MonitorWindow(listener)
+    manager = ConnectionManager()
+    win = MonitorWindow(manager)
     win.resize(720, 860)
     win.show()
     sys.exit(app.exec())
