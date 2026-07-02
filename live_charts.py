@@ -11,7 +11,7 @@ AXIS_COLORS = {"x": "#e53935", "y": "#43a047", "z": "#1e88e5"}
 # Smallest y-axis span the autoscaler will zoom to, so tiny motions are visible
 # without the axis collapsing onto sensor noise. (g for accel, deg/s for gyro.)
 ACCEL_MIN_SPAN = 0.2
-GYRO_MIN_SPAN = 20.0
+GYRO_MIN_SPAN = 5.0
 Y_PADDING = 0.15  # fraction of span added above/below the data
 
 class ChartPanel(QWidget):

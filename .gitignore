@@ -19,3 +19,6 @@ Thumbs.db
 
 # Secrets -- real credentials live here (copy from secrets.example.h)
 secrets.h
+
+# Runtime state -- the Connect tab's remembered default device (machine-specific)
+connect_config.json

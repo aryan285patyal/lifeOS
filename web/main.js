@@ -42,14 +42,9 @@ function makeFaceTexture(label, color) {
 }
 
 function createModel() {
-  // SWAP POINT: replace with a glTF loader later; keep returning { mesh }.
-  const geom = new THREE.BoxGeometry(2, 2, 2);
-  const mats = FACES.map(f => new THREE.MeshStandardMaterial({
-    map: makeFaceTexture(f.label, f.color),
-    metalness: 0.1,
-    roughness: 0.8,
-  }));
-  return { mesh: new THREE.Mesh(geom, mats) };
+  // SWAP POINT: procedural hand from hand_model.js. Still returns { mesh }, so
+  // the animate loop drives its quaternion exactly as it did the cube.
+  return createHandModel();
 }
 
 function init() {
