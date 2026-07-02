@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
+TEMP = "tp"                # optional: MPU6050 die temperature, raw counts
 ACCEL_LSB_PER_G = 16384.0  # MPU6050 default full-scale +/-2 g
 GYRO_LSB_PER_DPS = 131.0   # MPU6050 default full-scale +/-250 deg/s
 
@@ -17,6 +18,8 @@ def convert(name, raw):
     """Converts raw sensor values to physical units."""
     if name in ("ax", "ay", "az"):
         return (raw / ACCEL_LSB_PER_G, "g")
+    elif name == TEMP:
+        return (raw / 340.0 + 36.53, "°C")   # MPU6050 datasheet formula
     else:
         return (raw / GYRO_LSB_PER_DPS, "°/s")
 
@@ -58,10 +61,12 @@ class CleanInput:
         is_real = bool(values) and all(k in values for k in SENSORS) and last_seen != self._last_seen
         if is_real:
             self._confirmed = {k: values[k] for k in SENSORS}
+            if TEMP in values:                  # optional (older firmware omits it)
+                self._confirmed[TEMP] = values[TEMP]
             self._last_seen = last_seen
         if self._confirmed is None:
             return CleanSample(now, False, True, None, None)
-        converted = {k: convert(k, self._confirmed[k]) for k in SENSORS}
+        converted = {k: convert(k, v) for k, v in self._confirmed.items()}
         return CleanSample(now, True, not is_real, dict(self._confirmed), converted)
 
 
@@ -83,6 +88,10 @@ def _smoke():
     pkt2 = {"ax": 8192, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
     s = ci.update(pkt2, 1.3)
     assert not s.assumed and abs(s.converted["ax"][0] - 0.5) < 1e-9
+    assert TEMP not in s.converted            # temp is optional, absent here
+    pkt3 = dict(pkt2, tp=340)                 # +1 degC over the 36.53 offset
+    s = ci.update(pkt3, 1.4)
+    assert abs(s.converted[TEMP][0] - 37.53) < 1e-9 and s.converted[TEMP][1] == "°C"
     print("CleanInput smoke OK")
 
 

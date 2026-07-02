@@ -23,7 +23,8 @@ Files:
 - `lifeOs.ino` — firmware (MPU6050 DMP + servos + BT sensor link + Wi-Fi video).
 - `gui.py` — PySide6 app: **Connect**, **Monitor**, **Visualizer**, **Servos**
   tabs, plus a bottom-left status bar.
-- `CleanInput.py`, `live_charts.py` — packet cleaning / unit conversion + charts.
+- `CleanInput.py`, `live_charts.py` — packet cleaning / unit conversion + the
+  per-sensor `Sparkline` widgets used in the Monitor table.
 - `web/` — vendored three.js scene for the Visualizer.
 - `reciever.py` — legacy terminal receiver (old Wi-Fi/UDP sensor mode).
 - `bt_receiver.py` — terminal receiver for the Bluetooth sensor link.
@@ -35,24 +36,35 @@ Files:
 **Sensor telemetry (Bluetooth), one newline-delimited line per sample (~50 Hz):**
 
 ```
-q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,s0:<i>,s1:<i>,dmp:<i>,wf:<i>
+q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:<i>,s1:<i>,e0:<i>,e1:<i>,dmp:<i>,wf:<i>
 ```
 
 - `q0..q3` — fused DMP quaternion (w, x, y, z), floats.
 - `ax..gz` — raw accel/gyro counts (converted on the PC).
+- `tp` — raw die-temperature counts (°C = raw/340 + 36.53, converted on the
+  PC). Optional: the GUI tolerates firmware that doesn't send it.
 - `s0..s1` — servo angles the ESP32 holds (echoed back).
+- `e0..e1` — 1 if that servo is enabled (attached); 0 = detached/limp.
 - `dmp` — 1 if the DMP is producing orientation (drives the MPU status dot).
 - `wf` — 1 if Wi-Fi video is streaming (drives the Wi-Fi status dot).
 
-`q*` parse as float, everything else int.
+`q*` parse as float, everything else int. Non-telemetry replies (`cal:*`,
+`wifi:*`, `id:*`) arrive on the same stream; `Link._ingest` stashes them per
+prefix for `Link.control()`.
 
 **Control lines PC→ESP32 (Bluetooth):**
 - `s0:90,s1:45` — servo command.
+- `e0:1,e1:0` — enable/disable individual servos (0 detaches the pin → limp;
+  re-enable restores the last commanded angle).
+- `cal` — re-run the MPU6050 accel/gyro bias calibration (hold the sensor
+  still; replies `cal:start` then `cal:done`; telemetry pauses ~2 s).
 - `id?` → ESP32 replies `id:lifeos,proto:1,servos:2` (used to auto-detect the
   lifeOs COM port).
 - `wifi:<ssid>|<password>|<laptop_ip>` — provision Wi-Fi; the ESP32 joins that
   network and streams video UDP to `<laptop_ip>:5010`. Replies `wifi:connecting`
   then `wifi:connected,<esp_ip>` over Bluetooth.
+- `wifi:off` — active video/Wi-Fi teardown: stops the stream and turns the
+  radio off until re-provisioned. Replies `wifi:off,ok`.
 
 **Video (Wi-Fi UDP → port 5010):** synthetic `vid:<seq>:`-prefixed 1 KB packets.
 
@@ -60,12 +72,33 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,s0:<i>,s1:
 
 - **Connect tab** — two sections (no transport dropdown):
   - *Bluetooth (sensor & servos)*: COM port list, **Find lifeOs port**
-    (auto-detects by sending `id?`/reading telemetry), Connect, Save as default.
+    (auto-detects by sending `id?`/reading telemetry), Connect, Disconnect
+    (closes the COM port, which actively tears the SPP link down), Save as
+    default.
   - *Wi-Fi (video)*: SSID / password / laptop-IP fields (IP auto-filled),
-    Connect (sends creds over the active BT link), Save as default.
+    Connect (sends creds over the active BT link), Disconnect (sends
+    `wifi:off`), Save as default.
   - Saved defaults auto-connect BT and auto-provision video on launch.
 - **Monitor / Visualizer / Servos** — read through a `ConnectionManager` and are
   transport-agnostic.
+  - Monitor's table rows are interleaved per axis — ax, gx, ay, gy, az, gz,
+    temp — with a 4th **History** column: one autoscaled `Sparkline` per row
+    (last 100 samples; x red, y green, z blue, temp yellow) instead of separate
+    accel/gyro charts. Temperature is display-only (never zeroed by
+    Reset / Recalibrate — see `CALIB_SENSORS` vs `SENSORS`). Below it, a second
+    table shows roll/pitch/yaw **relative to the zero pose** (captured when
+    Reset / Recalibrate locks in; before that, relative to the DMP startup
+    pose) plus **Delta Temp**, the die-temperature change since the first
+    reading of the session (recalibrate once it flattens).
+  - Monitor's **Reset / Recalibrate** sends `cal` (device bias recalibration),
+    waits for `cal:done` (timeout `DEVICE_CAL_TIMEOUT`), then averages
+    `CALIB_SAMPLES` packets into a receiver-side zero for the raw counts.
+  - Visualizer de-drifts yaw: while the raw counts say the sensor is still, yaw
+    change is treated as drift, frozen out, and the creep rate is learned (and
+    subtracted during motion). Its **Zero** button cancels heading only
+    (swing-twist), keeping gravity-true roll/pitch.
+  - Servos tab has a per-servo **Enabled/Disabled** toggle (`e<i>:0/1`, detach =
+    limp) next to the slider; dial labels show "(off)" from the echoed `e*`.
 - **Status bar (bottom-left)** — colored `StatusDot` boxes (BT blue, Wi-Fi green,
   Servo1/Servo2 red, MPU yellow) showing ✓/✗ by whether that source had a live
   signal in the last second (all derived from the fresh BT telemetry line).
@@ -128,8 +161,9 @@ section → SSID/password → Connect. Verify video with
 
 ## Notes
 
-- Yaw drifts (no magnetometer); roll/pitch stable. Use the Visualizer's
-  Zero / Level.
+- Yaw drifts (no magnetometer); roll/pitch stable. Mitigations: the
+  Visualizer's stillness-based yaw de-drift, its heading-only Zero button, and
+  Monitor's Reset/Recalibrate (`cal`). Only a magnetometer would eliminate it.
 - The saved Wi-Fi password lives in `connect_config.json` (gitignored, plaintext).
 - PC tools target Windows (`netstat`/`tasklist`; `reciever.py` uses `msvcrt`).
 - PySide6 is pinned to 6.8.0.2 (newer needs an MSVC runtime some Python builds

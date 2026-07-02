@@ -7,8 +7,11 @@
 let renderer, scene, camera, controls, model;
 
 // Latest orientation from the device, already remapped into three.js axes.
+// (Python already subtracts estimated yaw drift before pushing it here.)
 let lastDevice = new THREE.Quaternion();
-// Inverse of the pose captured when "Zero / Level" was pressed (identity = none).
+// Inverse of the HEADING captured when "Zero / Level" was pressed (identity =
+// none). Yaw-only on purpose: roll/pitch are gravity-referenced by the DMP, so
+// zeroing the full pose would bake a tilted stance in as "level".
 let zeroRef = new THREE.Quaternion();
 
 // BoxGeometry material order is +X, -X, +Y, -Y, +Z, -Z.
@@ -103,7 +106,15 @@ function connectBridge() {
     const bridge = channel.objects.bridge;
     bridge.orientation.connect(onOrientation);
     bridge.zeroRequested.connect(function () {
-      zeroRef.copy(lastDevice).invert();
+      // Swing-twist decomposition: keep only the twist about the vertical
+      // (scene Y) axis and cancel that, leaving gravity-true roll/pitch alone.
+      const q = lastDevice;
+      const twist = new THREE.Quaternion(0, q.y, 0, q.w);
+      if (twist.lengthSq() < 1e-8) {
+        zeroRef.set(0, 0, 0, 1);   // pose is a pure 180° tilt: nothing to zero
+        return;
+      }
+      zeroRef.copy(twist.normalize()).invert();
     });
   });
 }

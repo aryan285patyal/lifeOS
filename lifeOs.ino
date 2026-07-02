@@ -11,7 +11,12 @@
 //     stream lets us test the Wi-Fi path.)
 //
 // Provisioning line (over Bluetooth):  wifi:<ssid>|<password>|<laptop_ip>
+// Stop video / Wi-Fi off (Bluetooth):  wifi:off  ->  wifi:off,ok
 // Identity query (over Bluetooth):     id?  ->  id:lifeos,proto:1,servos:N
+// IMU recalibration (over Bluetooth):  cal  ->  cal:start ... cal:done
+//   (re-runs accel+gyro bias calibration; keep the sensor still ~2 s; telemetry
+//    pauses while it runs)
+// Servo enable/disable (Bluetooth):    e0:1,e1:0  (0 = detach, servo goes limp)
 //
 // Concurrency: an IMU task on core 0 drains the DMP FIFO (interrupt on GPIO4);
 // loop() on core 1 runs Bluetooth + the Wi-Fi video sender.
@@ -42,6 +47,7 @@ const long   videoInterval = 20;     // video frame period, ms
 const int SERVO_PINS[NUM_SERVOS] = {13, 25};
 Servo servos[NUM_SERVOS];
 int   servoPos[NUM_SERVOS] = {90, 90};   // last commanded angle; echoed in telemetry
+bool  servoEnabled[NUM_SERVOS] = {true, true};  // detached (limp) when false; echoed as e0/e1
 
 MPU6050 mpu;
 BluetoothSerial SerialBT;
@@ -56,7 +62,7 @@ unsigned long lastVideoTime = 0;
 uint32_t      videoSeq      = 0;
 
 // --- DMP state (touched only by setup + the IMU task) ---
-bool     dmpReady   = false;
+volatile bool dmpReady = false;      // also cleared by recalibrateImu() on core 1
 uint8_t  devStatus;
 uint16_t packetSize;
 uint8_t  fifoBuffer[64];
@@ -64,11 +70,18 @@ uint8_t  fifoBuffer[64];
 volatile bool mpuInterrupt = false;
 void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
 
+// Recalibration handshake: loop() (core 1) must not touch the I2C bus while the
+// IMU task (core 0) is mid-read, so it raises imuPause and waits for the task
+// to acknowledge idling via imuPaused before calibrating.
+volatile bool imuPause  = false;
+volatile bool imuPaused = false;
+
 // --- Shared latest sample, written by the IMU task, read by loop() ---
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile float    sQ[4]     = {1, 0, 0, 0};
 volatile int16_t  sAccel[3] = {0, 0, 0};
 volatile int16_t  sGyro[3]  = {0, 0, 0};
+volatile int16_t  sTemp     = 0;         // die temperature, raw counts
 volatile uint32_t sSeq      = 0;
 
 TaskHandle_t imuTaskHandle = NULL;
@@ -85,7 +98,12 @@ void imuTask(void *param) {
   int16_t      gyro[3];
 
   for (;;) {
-    if (!dmpReady) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+    if (!dmpReady || imuPause) {
+      imuPaused = true;                // signal loop() the I2C bus is free
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    imuPaused = false;
 
     if (!mpuInterrupt && mpu.getFIFOCount() < packetSize) {
       vTaskDelay(1);
@@ -108,11 +126,13 @@ void imuTask(void *param) {
       mpu.dmpGetQuaternion(&q, fifoBuffer);
       mpu.dmpGetAccel(&accel, fifoBuffer);
       mpu.dmpGetGyro(gyro, fifoBuffer);
+      int16_t temp = mpu.getTemperature();   // not in the FIFO; separate register
 
       portENTER_CRITICAL(&stateMux);
       sQ[0] = q.w; sQ[1] = q.x; sQ[2] = q.y; sQ[3] = q.z;
       sAccel[0] = accel.x; sAccel[1] = accel.y; sAccel[2] = accel.z;
       sGyro[0] = gyro[0]; sGyro[1] = gyro[1]; sGyro[2] = gyro[2];
+      sTemp = temp;
       sSeq++;
       portEXIT_CRITICAL(&stateMux);
     }
@@ -123,28 +143,74 @@ void imuTask(void *param) {
 // ---------------------------------------------------------------------------
 // Bluetooth: sensor telemetry out; commands + provisioning in.
 // ---------------------------------------------------------------------------
-void buildTelemetry(char *buffer, size_t n,
-                    const float q[4], const int16_t a[3], const int16_t g[3]) {
+void buildTelemetry(char *buffer, size_t n, const float q[4],
+                    const int16_t a[3], const int16_t g[3], int16_t t) {
   // dmp = MPU DMP producing orientation; wf = Wi-Fi video streaming. These let
   // the GUI status bar light the MPU and Wi-Fi indicators truthfully.
+  // tp = die temperature, raw counts (degC = raw/340 + 36.53, done on the PC).
   snprintf(buffer, n,
            "q0:%.4f,q1:%.4f,q2:%.4f,q3:%.4f,ax:%d,ay:%d,az:%d,gx:%d,gy:%d,gz:%d,"
-           "s0:%d,s1:%d,dmp:%d,wf:%d",
+           "tp:%d,s0:%d,s1:%d,e0:%d,e1:%d,dmp:%d,wf:%d",
            q[0], q[1], q[2], q[3], a[0], a[1], a[2], g[0], g[1], g[2],
-           servoPos[0], servoPos[1],
+           t, servoPos[0], servoPos[1],
+           servoEnabled[0] ? 1 : 0, servoEnabled[1] ? 1 : 0,
            dmpReady ? 1 : 0, (videoState == VID_STREAMING) ? 1 : 0);
+}
+
+void setServoEnabled(int idx, bool en) {
+  if (en == servoEnabled[idx]) return;
+  servoEnabled[idx] = en;
+  if (en) {
+    servos[idx].setPeriodHertz(50);
+    servos[idx].attach(SERVO_PINS[idx], 500, 2400);
+    servos[idx].write(servoPos[idx]);  // resume at the last commanded angle
+  } else {
+    servos[idx].detach();              // stop pulses; the servo goes limp
+  }
 }
 
 void applyServoCommand(char *buf) {
   for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
-    int idx, ang;
-    if (sscanf(tok, "s%d:%d", &idx, &ang) == 2 && idx >= 0 && idx < NUM_SERVOS) {
-      if (ang < 0)   ang = 0;
-      if (ang > 180) ang = 180;
-      servoPos[idx] = ang;
-      servos[idx].write(ang);
+    int idx, val;
+    if (sscanf(tok, "s%d:%d", &idx, &val) == 2 && idx >= 0 && idx < NUM_SERVOS) {
+      if (val < 0)   val = 0;
+      if (val > 180) val = 180;
+      servoPos[idx] = val;             // remembered even while disabled
+      if (servoEnabled[idx]) servos[idx].write(val);
+    } else if (sscanf(tok, "e%d:%d", &idx, &val) == 2 && idx >= 0 && idx < NUM_SERVOS) {
+      setServoEnabled(idx, val != 0);
     }
   }
+}
+
+// Re-run the MPU6050 bias calibration on demand (BT line "cal"). Blocks loop()
+// for ~1-2 s, so telemetry pauses; the sensor must be held still meanwhile.
+void recalibrateImu() {
+  if (!dmpReady) {
+    SerialBT.println("cal:error,dmp-not-ready");
+    return;
+  }
+  SerialBT.println("cal:start");
+  imuPause = true;
+  while (!imuPaused) vTaskDelay(1);    // wait for the IMU task to free the bus
+  mpu.setDMPEnabled(false);
+  mpu.CalibrateAccel(6);
+  mpu.CalibrateGyro(6);
+  mpu.resetFIFO();
+  mpu.setDMPEnabled(true);
+  imuPause = false;
+  SerialBT.println("cal:done");
+  Serial.println("IMU biases recalibrated (BT request)");
+}
+
+// Active Wi-Fi shutdown (BT line "wifi:off"): stop video and turn the radio off
+// until the next provisioning, instead of leaving the laptop to just ignore it.
+void stopWifiVideo() {
+  videoState = VID_IDLE;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  SerialBT.println("wifi:off,ok");
+  Serial.println("Wi-Fi video stopped (BT request)");
 }
 
 // Start (or restart) the Wi-Fi station link for video. args = "ssid|pass|ip".
@@ -173,6 +239,10 @@ void provisionWifi(char *args) {
 void handleBtLine(char *line) {
   if (strcmp(line, "id?") == 0) {
     SerialBT.printf("id:lifeos,proto:1,servos:%d\n", NUM_SERVOS);
+  } else if (strcmp(line, "cal") == 0) {
+    recalibrateImu();
+  } else if (strcmp(line, "wifi:off") == 0) {   // before the wifi: prefix match
+    stopWifiVideo();
   } else if (strncmp(line, "wifi:", 5) == 0) {
     provisionWifi(line + 5);
   } else {
@@ -194,10 +264,11 @@ void btPoll() {
   }
 }
 
-void btSendSensor(const float q[4], const int16_t a[3], const int16_t g[3]) {
+void btSendSensor(const float q[4], const int16_t a[3], const int16_t g[3],
+                  int16_t t) {
   if (!SerialBT.hasClient()) return;
   char buffer[200];
-  buildTelemetry(buffer, sizeof(buffer), q, a, g);
+  buildTelemetry(buffer, sizeof(buffer), q, a, g, t);
   SerialBT.println(buffer);
 }
 
@@ -286,18 +357,19 @@ void loop() {
   previousTime = currentTime;
 
   float    q[4];
-  int16_t  a[3], g[3];
+  int16_t  a[3], g[3], t;
   uint32_t seq;
 
   portENTER_CRITICAL(&stateMux);
   q[0] = sQ[0]; q[1] = sQ[1]; q[2] = sQ[2]; q[3] = sQ[3];
   a[0] = sAccel[0]; a[1] = sAccel[1]; a[2] = sAccel[2];
   g[0] = sGyro[0]; g[1] = sGyro[1]; g[2] = sGyro[2];
+  t    = sTemp;
   seq  = sSeq;
   portEXIT_CRITICAL(&stateMux);
 
   if (seq == lastSentSeq) return;
   lastSentSeq = seq;
 
-  btSendSensor(q, a, g);
+  btSendSensor(q, a, g, t);
 }
