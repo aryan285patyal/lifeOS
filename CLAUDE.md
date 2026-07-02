@@ -99,6 +99,10 @@ prefix for `Link.control()`.
     (swing-twist), keeping gravity-true roll/pitch.
   - Servos tab has a per-servo **Enabled/Disabled** toggle (`e<i>:0/1`, detach =
     limp) next to the slider; dial labels show "(off)" from the echoed `e*`.
+- **Hand Model tab** — dropdown of the PC's video input devices (via
+  QtMultimedia `QMediaDevices`); Apply streams the selected camera into a small
+  preview box (`QCamera` → `QMediaCaptureSession` → `QVideoWidget`). Planned:
+  the ESP32's Wi-Fi UDP video as another selectable source, then hand tracking.
 - **Status bar (bottom-left)** — colored `StatusDot` boxes (BT blue, Wi-Fi green,
   Servo1/Servo2 red, MPU yellow) showing ✓/✗ by whether that source had a live
   signal in the last second (all derived from the fresh BT telemetry line).

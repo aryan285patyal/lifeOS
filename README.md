@@ -40,7 +40,7 @@ Wi-Fi video).
 | File | Role |
 | --- | --- |
 | `lifeOs.ino` | ESP32 firmware. MPU6050 DMP + servos, Bluetooth sensor/control link, Wi-Fi video on demand. |
-| `gui.py` | PySide6 app: Connect / Monitor / Visualizer / Servos tabs + status bar. |
+| `gui.py` | PySide6 app: Connect / Monitor / Visualizer / Servos / Hand Model tabs + status bar. |
 | `CleanInput.py` | Cleans the packet stream, converts raw counts to physical units. |
 | `live_charts.py` | Scrolling Qt charts for the Monitor tab. |
 | `web/` | Vendored three.js scene for the Visualizer. |

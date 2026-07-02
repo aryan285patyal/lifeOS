@@ -16,6 +16,12 @@ from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
+try:
+    from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    HAVE_MULTIMEDIA = True
+except ImportError:                       # GUI still runs; Hand Model tab degrades
+    HAVE_MULTIMEDIA = False
 from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
 from CleanInput import CleanInput, convert, format_converted
@@ -1013,6 +1019,101 @@ class ConnectTab(QWidget):
             self.connect_video()
 
 
+class HandModelTab(QWidget):
+    """Video-input preview for the future hand-detection model. The dropdown
+    lists every video input device on this PC (e.g. the laptop webcam); Apply
+    streams the selected one into the preview box next to the selector. The
+    ESP32's Wi-Fi UDP video will be added as another selectable source later."""
+
+    def __init__(self):
+        super().__init__()
+        self._devices = []          # QCameraDevice per combo row
+        self._camera = None
+        self._session = None
+
+        root = QVBoxLayout(self)
+
+        if not HAVE_MULTIMEDIA:
+            msg = QLabel("PySide6 QtMultimedia is not available - reinstall "
+                         "PySide6 to use video input here.")
+            msg.setWordWrap(True)
+            msg.setAlignment(Qt.AlignCenter)
+            root.addWidget(msg)
+            root.addStretch(1)
+            return
+
+        row = QHBoxLayout()
+
+        controls = QVBoxLayout()
+        controls.addWidget(QLabel("Video input device:"))
+        self.device_combo = QComboBox()
+        controls.addWidget(self.device_combo)
+
+        btn_row = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_devices)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.clicked.connect(self.apply)
+        btn_row.addWidget(self.refresh_btn)
+        btn_row.addWidget(self.apply_btn)
+        controls.addLayout(btn_row)
+
+        self.status_label = QLabel("Pick a device and press Apply.")
+        self.status_label.setWordWrap(True)
+        controls.addWidget(self.status_label)
+        controls.addStretch(1)
+        row.addLayout(controls, 1)
+
+        self.video = QVideoWidget()
+        self.video.setFixedSize(320, 240)     # small preview beside the selector
+        row.addWidget(self.video)
+
+        root.addLayout(row)
+        root.addStretch(1)
+
+        self.refresh_devices()
+
+    def refresh_devices(self):
+        prev = self.device_combo.currentText()
+        self.device_combo.clear()
+        self._devices = list(QMediaDevices.videoInputs())
+        for dev in self._devices:
+            self.device_combo.addItem(dev.description())
+        if not self._devices:
+            self.device_combo.addItem("(no video input devices found)")
+        idx = self.device_combo.findText(prev)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
+
+    def apply(self):
+        idx = self.device_combo.currentIndex()
+        if not (0 <= idx < len(self._devices)):
+            self.status_label.setText("No video input device selected.")
+            return
+        self.stop()
+        dev = self._devices[idx]
+        self._camera = QCamera(dev)
+        self._camera.errorOccurred.connect(self._on_camera_error)
+        self._session = QMediaCaptureSession(self)
+        self._session.setCamera(self._camera)
+        self._session.setVideoOutput(self.video)
+        self._camera.start()
+        self.status_label.setText(f"Streaming: {dev.description()}")
+
+    def _on_camera_error(self, _error, message):
+        self.status_label.setText(f"Camera error: {message}")
+
+    def stop(self):
+        """Release the camera (so other apps can use it / on window close)."""
+        if self._camera is not None:
+            try:
+                self._camera.stop()
+            except Exception:
+                pass
+            self._camera = None
+        self._session = None
+
+
 class StatusDot(QLabel):
     """A small colored box in the status bar. Its source color is fixed (so you
     can always tell which is which); a tick (live) or cross (no signal in the
@@ -1117,6 +1218,8 @@ class MonitorWindow(QMainWindow):
         tabs.addTab(self.visualizer, "Visualizer")
         self.servos = ServoTab(self.listener)
         tabs.addTab(self.servos, "Servos")
+        self.hand_model = HandModelTab()
+        tabs.addTab(self.hand_model, "Hand Model")
         self.setCentralWidget(tabs)
 
         self._build_status_bar()
@@ -1285,6 +1388,10 @@ class MonitorWindow(QMainWindow):
     def closeEvent(self, event):
         try:
             self.listener.close()    # stop the active link (socket / COM port)
+        except Exception:
+            pass
+        try:
+            self.hand_model.stop()   # release the webcam
         except Exception:
             pass
         super().closeEvent(event)
