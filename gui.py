@@ -1,8 +1,8 @@
 import sys
 import os
 import json
+import math
 import socket
-import subprocess
 import threading
 import time
 
@@ -24,12 +24,15 @@ except ImportError:                       # GUI still runs; Hand Model tab degra
     HAVE_MULTIMEDIA = False
 from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
-from CleanInput import CleanInput, format_converted
-from live_charts import ChartPanel
+from CleanInput import CleanInput, convert, format_converted
+from live_charts import sparkline_for
 
 QUAT = ["q0", "q1", "q2", "q3"]
 
-SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
+# Monitor table rows: accel/gyro interleaved per axis, then die temperature.
+SENSORS = ["ax", "gx", "ay", "gy", "az", "gz", "tp"]
+# The axes Reset / Recalibrate zeroes (temperature has no meaningful zero).
+CALIB_SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
 
 NUM_SERVOS = 2                        # must match NUM_SERVOS in lifeOs.ino
 SERVO_GPIOS = [13, 25]               # for display only; matches SERVO_PINS in firmware
@@ -78,6 +81,70 @@ def get_local_ip():
         s.close()
 
 
+# Servo "mimic" inputs: the axes the hand orientation can be decomposed into.
+MIMIC_INPUTS = ["Manual", "Roll", "Pitch", "Yaw"]
+
+
+def quat_to_euler(w, x, y, z):
+    """Quaternion (w,x,y,z) -> (roll, pitch, yaw) in degrees, matching the
+    orientation the Visualizer shows."""
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+
+    sinp = 2 * (w * y - z * x)
+    if abs(sinp) >= 1:
+        pitch = math.degrees(math.copysign(math.pi / 2, sinp))
+    else:
+        pitch = math.degrees(math.asin(sinp))
+
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+    return roll, pitch, yaw
+
+
+def wrap180(deg):
+    """Fold an angle/delta into [-180, 180) so wrap-arounds don't explode."""
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def quat_yaw(w, x, y, z):
+    """Heading (degrees) about the DMP world vertical - the drifting axis."""
+    return math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+
+
+def quat_mul(a, b):
+    """Hamilton product of two (w,x,y,z) quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw)
+
+
+def quat_about_z(deg):
+    """Quaternion rotating `deg` about the DMP world vertical (Z-up)."""
+    h = math.radians(deg) / 2
+    return (math.cos(h), 0.0, 0.0, math.sin(h))
+
+
+def axis_to_servo(axis, roll, pitch, yaw):
+    """Map one Euler axis (degrees) onto a 0-180 servo angle. Roll/pitch (±90)
+    map directly with a +90 offset; yaw (±180) is halved so its full range fits.
+    Returns None for 'Manual'/unknown."""
+    if axis == "Roll":
+        v = roll + 90
+    elif axis == "Pitch":
+        v = pitch + 90
+    elif axis == "Yaw":
+        v = yaw / 2 + 90
+    else:
+        return None
+    return max(0, min(180, int(round(v))))
+
+
 def list_serial_ports():
     """[(device, description)] of COM ports, or [] if pyserial isn't installed."""
     try:
@@ -118,49 +185,17 @@ def probe_lifeos_port(timeout=1.5, skip=None):
     return None
 
 CALIB_SAMPLES = 20          # fresh samples averaged into the zero baseline on reset
+DEVICE_CAL_TIMEOUT = 10.0   # seconds to wait for the ESP32's cal:done reply
+
+# Stillness detection for the Visualizer's yaw de-drift, on the raw counts
+# (DMP full scales: accel +/-2g -> 16384 LSB/g, gyro +/-2000 dps -> 16.4 LSB/dps).
+STILL_GYRO_COUNTS = 60      # per-axis |gyro| below this (~3.7 deg/s) = not rotating
+STILL_ACCEL_DELTA = 1200    # | |accel| - 1g | below this = not accelerating
+STILL_MIN_SECS = 0.5        # stillness must hold this long before it's trusted
 
 COLOR_REAL = "#2e7d32"      # green - value came from a fresh packet
 COLOR_ASSUMED = "#c62828"   # red   - value was held over (missing/garbled)
 COLOR_NODATA = "#9e9e9e"    # grey  - no packet received yet
-
-
-def find_port_users(port):
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano", "-p", "UDP"],
-            capture_output=True,
-            text=True,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
-        )
-        lines = result.stdout.strip().split('\n')
-        pids = set()
-
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 4 and parts[0] == "UDP" and parts[1].endswith(f":{port}"):
-                pid = parts[-1]
-                pids.add(pid)
-
-        users = []
-        for pid in pids:
-            try:
-                tasklist_result = subprocess.run(
-                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                    capture_output=True,
-                    text=True,
-                    creationflags=0x08000000  # CREATE_NO_WINDOW
-                )
-                tlines = tasklist_result.stdout.strip().split('\n')
-                if tlines:
-                    name = tlines[0].split(',')[0].strip().strip('"')
-                    users.append((pid, name))
-            except Exception:
-                users.append((pid, "unknown"))
-
-        return users
-
-    except Exception:
-        return []
 
 
 def parse_line(text):
@@ -178,15 +213,24 @@ class Link:
     transports carry the same newline/packet ASCII protocol, so only the byte
     source differs. Subclasses implement start/stop/send_servos/description."""
 
+    # non-telemetry replies the ESP32 sends over the same stream, kept per prefix
+    CONTROL_PREFIXES = ("cal:", "wifi:", "id:")
+
     def __init__(self):
         self.lock = threading.Lock()
         self.latest = {}
         self.last_seen = 0.0
+        self.controls = {}          # prefix -> (full line, monotonic timestamp)
 
     def _ingest(self, text):
         try:
             d = parse_line(text)
         except Exception:
+            for prefix in self.CONTROL_PREFIXES:
+                if text.startswith(prefix):
+                    with self.lock:
+                        self.controls[prefix] = (text, time.monotonic())
+                    break
             return
         with self.lock:
             self.latest = d
@@ -195,6 +239,12 @@ class Link:
     def snapshot(self):
         with self.lock:
             return (self.latest.copy(), self.last_seen)
+
+    def control(self, prefix):
+        """Latest control reply starting with `prefix` as (line, timestamp),
+        or (None, 0.0) if none arrived yet."""
+        with self.lock:
+            return self.controls.get(prefix, (None, 0.0))
 
     def is_connected(self, timeout=1.0):
         with self.lock:
@@ -208,6 +258,10 @@ class Link:
         pass
 
     def send_servos(self, angles):
+        return False
+
+    def send_line(self, text):
+        """Send one raw control line (e.g. 'cal', 'e0:0', 'wifi:off')."""
         return False
 
     def description(self):
@@ -318,27 +372,22 @@ class BluetoothLink(Link):
             except Exception:
                 pass
 
-    def send_servos(self, angles):
+    def send_line(self, text):
         if not self.ser:
             return False
-        msg = ",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)) + "\n"
         try:
-            self.ser.write(msg.encode())
+            self.ser.write((text.rstrip() + "\n").encode())
             return True
         except Exception:
             return False
 
+    def send_servos(self, angles):
+        return self.send_line(",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)))
+
     def provision_video(self, ssid, password, ip):
         """Send Wi-Fi credentials + the laptop's IP so the ESP32 brings up Wi-Fi
         and streams video UDP back to us. Format: 'wifi:<ssid>|<pass>|<ip>'."""
-        if not self.ser:
-            return False
-        msg = f"wifi:{ssid}|{password}|{ip}\n"
-        try:
-            self.ser.write(msg.encode())
-            return True
-        except Exception:
-            return False
+        return self.send_line(f"wifi:{ssid}|{password}|{ip}")
 
     def description(self):
         return f"Bluetooth {self.com}"
@@ -367,8 +416,22 @@ class ConnectionManager:
     def send_servos(self, angles):
         return self.active.send_servos(angles) if self.active else False
 
+    def send_line(self, text):
+        return self.active.send_line(text) if self.active else False
+
+    def control(self, prefix):
+        return self.active.control(prefix) if self.active else (None, 0.0)
+
     def description(self):
         return self.active.description() if self.active else "Not connected"
+
+    def disconnect(self):
+        """Explicitly drop the active link. For Bluetooth this closes the COM
+        port, which tears the SPP connection down (the ESP32 sees its client
+        vanish) - an active disconnect, not just ignored traffic."""
+        if self.active:
+            self.active.stop()
+            self.active = None
 
     def close(self):
         if self.active:
@@ -473,6 +536,16 @@ class VisualizerTab(QWidget):
         self.zero_btn.clicked.connect(lambda: self.bridge.zeroRequested.emit())
         layout.addWidget(self.zero_btn)
 
+        # Yaw de-drift: yaw has no absolute reference (no magnetometer), so any
+        # residual gyro-z bias shows as a slow spin. While the raw counts say the
+        # sensor is physically still, any yaw change IS drift: freeze it out and
+        # learn the creep rate; while moving, keep subtracting the learned rate.
+        self._yaw_off = 0.0         # degrees subtracted from the device yaw
+        self._drift_rate = 0.0      # learned creep in deg/s (slow EMA)
+        self._still_since = None    # when the current stillness began
+        self._last_yaw = None
+        self._last_t = None
+
         # Push the latest quaternion to the page at ~30 Hz, independent of the
         # Monitor tab's refresh so the 3D view stays smooth.
         self.timer = QTimer(self)
@@ -482,20 +555,54 @@ class VisualizerTab(QWidget):
     def _tick(self):
         values, _ = self.listener.snapshot()
         if values and all(k in values for k in QUAT):
-            self.bridge.orientation.emit(
-                float(values["q0"]), float(values["q1"]),
-                float(values["q2"]), float(values["q3"]),
-            )
+            q = tuple(float(values[k]) for k in QUAT)
+            w, x, y, z = self._dedrift(q, values)
+            self.bridge.orientation.emit(w, x, y, z)
+
+    def _is_still(self, values):
+        try:
+            gyro = [abs(int(values[k])) for k in ("gx", "gy", "gz")]
+            acc = [int(values[k]) for k in ("ax", "ay", "az")]
+        except (KeyError, ValueError, TypeError):
+            return False
+        amag = math.sqrt(sum(v * v for v in acc))
+        return max(gyro) < STILL_GYRO_COUNTS and abs(amag - 16384) < STILL_ACCEL_DELTA
+
+    def _dedrift(self, q, values):
+        now = time.monotonic()
+        yaw = quat_yaw(*q)
+        dt = (now - self._last_t) if self._last_t is not None else 0.0
+        dyaw = wrap180(yaw - self._last_yaw) if self._last_yaw is not None else 0.0
+        self._last_t, self._last_yaw = now, yaw
+
+        if self._is_still(values):
+            if self._still_since is None:
+                self._still_since = now
+            elif now - self._still_since >= STILL_MIN_SECS:
+                self._yaw_off += dyaw          # still => this yaw change is drift
+                if dt > 0:
+                    self._drift_rate += 0.02 * (dyaw / dt - self._drift_rate)
+        else:
+            self._still_since = None
+            self._yaw_off += self._drift_rate * dt
+        self._yaw_off = wrap180(self._yaw_off)
+
+        # undo the accumulated drift about the world vertical
+        return quat_mul(quat_about_z(-self._yaw_off), q)
 
 
 class ServoTab(QWidget):
     """Control panel + visualizer for the ESP32 servos.
 
     Each servo has a slider/spinbox to pick a target angle and an 'Upload'
-    button that sends it over the reverse UDP channel. The read-only dials do
-    NOT follow the sliders directly -- they follow the angle the ESP32 echoes
-    back in its telemetry, so the visualizer always reflects the device's real
-    held position (even across a GUI restart or a dropped command)."""
+    button that sends it. The read-only dials follow the angle the ESP32 echoes
+    back, so they show the device's real held position.
+
+    Each servo also has an Input dropdown to MIMIC the hand: pick an orientation
+    axis (Roll / Pitch / Yaw) and that servo continuously tracks that component
+    of the Visualizer's orientation -- decomposing the 3D motion into one servo
+    per axis. 'Manual' leaves the servo under slider control. Different servos
+    can be linked to different axes independently."""
 
     def __init__(self, listener):
         super().__init__()
@@ -504,6 +611,9 @@ class ServoTab(QWidget):
         self.spins = []
         self.dials = []
         self.dial_labels = []
+        self.inputs = []            # per-servo QComboBox of MIMIC_INPUTS
+        self.enables = []           # per-servo enable/disable toggle buttons
+        self._last_sent = None      # last angles sent while mimicking (throttle)
 
         root = QVBoxLayout(self)
 
@@ -511,9 +621,19 @@ class ServoTab(QWidget):
         self.status_label.setAlignment(Qt.AlignCenter)
         root.addWidget(self.status_label)
 
+        hint = QLabel("Set a servo's Input to Roll/Pitch/Yaw to mimic that axis of "
+                      "the hand; 'Manual' uses the slider.")
+        hint.setWordWrap(True)
+        hint.setAlignment(Qt.AlignCenter)
+        root.addWidget(hint)
+
         for i in range(NUM_SERVOS):
             box = QGroupBox(f"Servo {i}  (GPIO {SERVO_GPIOS[i]})")
             row = QHBoxLayout(box)
+
+            combo = QComboBox()
+            combo.addItems(MIMIC_INPUTS)
+            combo.currentTextChanged.connect(lambda _t, idx=i: self._input_changed(idx))
 
             slider = QSlider(Qt.Horizontal)
             slider.setRange(0, 180)
@@ -527,8 +647,15 @@ class ServoTab(QWidget):
             # keep slider <-> spinbox mirrored without recursing
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
-            # live-send when the user finishes dragging the slider
+            # live-send when the user finishes dragging the slider (manual mode)
             slider.sliderReleased.connect(self.upload)
+
+            # enable/disable: disabling detaches the servo on the ESP32 (no PWM
+            # pulses, the horn goes limp) - an active off, not just "stop sending"
+            en_btn = QPushButton("Enabled")
+            en_btn.setCheckable(True)
+            en_btn.setChecked(True)
+            en_btn.toggled.connect(lambda on, idx=i: self._toggle_enable(idx, on))
 
             dial = QDial()
             dial.setRange(0, 180)
@@ -543,13 +670,18 @@ class ServoTab(QWidget):
             dial_col.addWidget(dial)
             dial_col.addWidget(dlabel)
 
+            row.addWidget(QLabel("Input"))
+            row.addWidget(combo)
             row.addWidget(slider, 1)
             row.addWidget(spin)
+            row.addWidget(en_btn)
             row.addLayout(dial_col)
             root.addWidget(box)
 
+            self.inputs.append(combo)
             self.sliders.append(slider)
             self.spins.append(spin)
+            self.enables.append(en_btn)
             self.dials.append(dial)
             self.dial_labels.append(dlabel)
 
@@ -577,6 +709,22 @@ class ServoTab(QWidget):
             self.sent_label.setText(
                 "Cannot send - not connected. Use the Connect tab first.")
 
+    def _toggle_enable(self, idx, on):
+        self.enables[idx].setText("Enabled" if on else "Disabled")
+        if self.listener.send_line(f"e{idx}:{1 if on else 0}"):
+            self.sent_label.setText(
+                f"Servo {idx} {'enabled' if on else 'disabled (detached, limp)'}.")
+        else:
+            self.sent_label.setText(
+                "Cannot send - not connected. Use the Connect tab first.")
+
+    def _input_changed(self, idx):
+        """A servo in mimic mode is driven by orientation, so lock its manual
+        controls; 'Manual' re-enables them."""
+        mimic = self.inputs[idx].currentText() != "Manual"
+        self.sliders[idx].setEnabled(not mimic)
+        self.spins[idx].setEnabled(not mimic)
+
     def _refresh(self):
         if self.listener.is_connected():
             self.status_label.setText(f"Connected via {self.listener.description()}")
@@ -584,11 +732,29 @@ class ServoTab(QWidget):
             self.status_label.setText("Not connected - use the Connect tab.")
 
         values, _ = self.listener.snapshot()
+
+        # Mimic: drive any servo whose Input is an orientation axis from the live
+        # quaternion, then push the whole set to the ESP32 (throttled to changes).
+        axes = [c.currentText() for c in self.inputs]
+        if any(a != "Manual" for a in axes) and all(k in values for k in QUAT):
+            roll, pitch, yaw = quat_to_euler(
+                values["q0"], values["q1"], values["q2"], values["q3"])
+            for i, axis in enumerate(axes):
+                ang = axis_to_servo(axis, roll, pitch, yaw)
+                if ang is not None:
+                    self.sliders[i].setValue(ang)   # setValue doesn't trigger a send
+            angles = [s.value() for s in self.sliders]
+            if angles != self._last_sent and self.listener.send_servos(angles):
+                self._last_sent = angles
+
+        # Dials always reflect the ESP32's echoed angles (true held position);
+        # the echoed e0/e1 flags flag a detached servo (older firmware: assume on).
         for i, key in enumerate(SERVO_KEYS):
             if key in values:
                 angle = int(values[key])
                 self.dials[i].setValue(angle)
-                self.dial_labels[i].setText(f"{angle} deg")
+                enabled = int(values.get(f"e{i}", 1)) == 1
+                self.dial_labels[i].setText(f"{angle} deg" if enabled else f"{angle} deg (off)")
             else:
                 self.dial_labels[i].setText("-")
 
@@ -652,9 +818,12 @@ class ConnectTab(QWidget):
         self.bt_find_btn.clicked.connect(self.find_lifeos)
         self.bt_connect_btn = QPushButton("Connect")
         self.bt_connect_btn.clicked.connect(self.connect_bt)
+        self.bt_disconnect_btn = QPushButton("Disconnect")
+        self.bt_disconnect_btn.clicked.connect(self.disconnect_bt)
         self.bt_default_btn = QPushButton("Save as default")
         self.bt_default_btn.clicked.connect(self.save_bt_default)
-        for b in (self.bt_refresh_btn, self.bt_find_btn, self.bt_connect_btn, self.bt_default_btn):
+        for b in (self.bt_refresh_btn, self.bt_find_btn, self.bt_connect_btn,
+                  self.bt_disconnect_btn, self.bt_default_btn):
             row.addWidget(b)
         v.addLayout(row)
         v.addWidget(QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth first, then "
@@ -727,6 +896,19 @@ class ConnectTab(QWidget):
         self.manager.set_active(link)
         self.status_label.setText(f"Opened {com} - waiting for sensor telemetry...")
 
+    def disconnect_bt(self):
+        """Active disconnect: closing the COM port tears the SPP link down, so
+        the ESP32 sees its Bluetooth client vanish (hasClient() goes false)."""
+        if not isinstance(self.manager.active, BluetoothLink):
+            self.status_label.setText("No Bluetooth link to disconnect.")
+            return
+        com = self.manager.active.com
+        self.manager.disconnect()
+        self.status_label.setStyleSheet("")
+        self.status_label.setText(
+            f"Bluetooth disconnected ({com} closed). Wi-Fi video, if running, "
+            f"continues until you stop it or re-provision.")
+
     def save_bt_default(self):
         r = self.bt_list.currentRow()
         if not (0 <= r < len(self._bt_rows)):
@@ -765,9 +947,12 @@ class ConnectTab(QWidget):
         row = QHBoxLayout()
         self.video_connect_btn = QPushButton("Connect (start video)")
         self.video_connect_btn.clicked.connect(self.connect_video)
+        self.video_disconnect_btn = QPushButton("Disconnect (stop video)")
+        self.video_disconnect_btn.clicked.connect(self.disconnect_video)
         self.video_default_btn = QPushButton("Save as default")
         self.video_default_btn.clicked.connect(self.save_video_default)
         row.addWidget(self.video_connect_btn)
+        row.addWidget(self.video_disconnect_btn)
         row.addWidget(self.video_default_btn)
         form.addLayout(row)
 
@@ -792,6 +977,20 @@ class ConnectTab(QWidget):
                 f"Run wifi_video_test.py to verify.")
         else:
             self.status_label.setText("Failed to send credentials over Bluetooth.")
+
+    def disconnect_video(self):
+        """Active disconnect: 'wifi:off' over Bluetooth makes the ESP32 stop the
+        video stream and switch its Wi-Fi radio off (until re-provisioned),
+        instead of us merely ignoring incoming packets."""
+        if not isinstance(self.manager.active, BluetoothLink):
+            self.status_label.setText(
+                "Bluetooth link needed to stop video - 'wifi:off' is sent over Bluetooth.")
+            return
+        if self.manager.send_line("wifi:off"):
+            self.status_label.setText(
+                "Sent wifi:off - the ESP32 stops streaming and turns its Wi-Fi off.")
+        else:
+            self.status_label.setText("Failed to send wifi:off over Bluetooth.")
 
     def save_video_default(self):
         self.config["video_ssid"] = self.ssid_edit.text().strip()
@@ -946,10 +1145,12 @@ class MonitorWindow(QMainWindow):
         self.setWindowTitle("lifeOs Monitor")
 
         # receiver-side zeroing: offsets are subtracted from every raw reading
-        self.offsets = {name: 0 for name in SENSORS}
+        self.offsets = {name: 0 for name in CALIB_SENSORS}
         self.calib_accum = None          # running per-axis sum during a recalibration
         self.calib_left = 0              # fresh samples still needed to finish
         self._calib_last_seen = None     # last_seen of the most recent accumulated sample
+        self._cal_waiting_device = False # True while the ESP32 runs its own bias cal
+        self._cal_sent_at = 0.0          # when the 'cal' command was sent
 
         central_widget = QWidget()
         layout = QVBoxLayout()
@@ -962,15 +1163,39 @@ class MonitorWindow(QMainWindow):
         layout.addWidget(self.status_label)
 
         self.clean = CleanInput()
-        self.table = QTableWidget(6, 3)
-        self.table.setHorizontalHeaderLabels(["Sensor", "Value", "Converted"])
+        self.table = QTableWidget(len(SENSORS), 4)
+        self.table.setHorizontalHeaderLabels(["Sensor", "Value", "Converted", "History"])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(36)   # room for the sparklines
+        self.sparks = {}                 # sensor name -> its History-column Sparkline
         for i, name in enumerate(SENSORS):
-            self.table.setItem(i, 0, QTableWidgetItem(name))
+            self.table.setItem(i, 0, QTableWidgetItem("temp" if name == "tp" else name))
             self.table.setItem(i, 1, QTableWidgetItem("-"))
             self.table.setItem(i, 2, QTableWidgetItem("-"))
+            self.sparks[name] = sparkline_for(name)
+            self.table.setCellWidget(i, 3, self.sparks[name])
         layout.addWidget(self.table)
+
+        # --- Relative state: angle from the zero pose per axis, plus the die
+        # temperature change since the stream started (self-heating indicator:
+        # recalibrate once it flattens). The zero pose is captured when Reset /
+        # Recalibrate locks in; before that, angles are relative to the DMP
+        # startup pose. ---
+        self._euler_zero = None
+        self._temp_base = None           # first temperature (degC) seen this session
+        self.angle_table = QTableWidget(4, 2)
+        self.angle_table.setHorizontalHeaderLabels(["Metric", "Delta from zero"])
+        self.angle_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.angle_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for i, metric in enumerate(("Roll", "Pitch", "Yaw", "Delta Temp")):
+            self.angle_table.setItem(i, 0, QTableWidgetItem(metric))
+            self.angle_table.setItem(i, 1, QTableWidgetItem("-"))
+        self.angle_table.setFixedHeight(
+            self.angle_table.rowCount() * self.angle_table.verticalHeader().defaultSectionSize()
+            + self.angle_table.horizontalHeader().sizeHint().height()
+            + 2 * self.angle_table.frameWidth())
+        layout.addWidget(self.angle_table)
 
         # --- Reset / recalibrate (zero the sensor) ---
         self.reset_btn = QPushButton("Reset / Recalibrate")
@@ -981,28 +1206,6 @@ class MonitorWindow(QMainWindow):
         self.calib_status_label.setWordWrap(True)
         self.calib_status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.calib_status_label)
-
-        self.charts = ChartPanel()
-        layout.addWidget(self.charts)
-
-        # --- Port diagnostics (Wi-Fi mode) ---
-        self.check_btn = QPushButton(f"Refresh / Check Port {UDP_PORT}")
-        self.check_btn.clicked.connect(self.check_port)
-        layout.addWidget(self.check_btn)
-
-        self.port_result_label = QLabel("Click the button above to check who is using the port.")
-        self.port_result_label.setWordWrap(True)
-        layout.addWidget(self.port_result_label)
-
-        kill_row = QHBoxLayout()
-        self.kill_cmd_edit = QLineEdit()
-        self.kill_cmd_edit.setReadOnly(True)
-        self.kill_cmd_edit.setPlaceholderText("kill command will appear here when the port is busy")
-        kill_row.addWidget(self.kill_cmd_edit)
-        self.copy_btn = QPushButton("Copy")
-        self.copy_btn.clicked.connect(self.copy_kill_cmd)
-        kill_row.addWidget(self.copy_btn)
-        layout.addLayout(kill_row)
 
         central_widget.setLayout(layout)
 
@@ -1045,15 +1248,32 @@ class MonitorWindow(QMainWindow):
         is_bt = isinstance(getattr(self.listener, "active", None), BluetoothLink)
         self.dot_bt.set_live(connected and is_bt)
         self.dot_wifi.set_live(connected and int(values.get("wf", 0)) == 1)
-        self.dot_s1.set_live(connected and "s0" in values)
-        self.dot_s2.set_live(connected and "s1" in values)
+        # a disabled (detached) servo counts as not live; older firmware without
+        # the e0/e1 fields is treated as enabled
+        self.dot_s1.set_live(connected and "s0" in values and int(values.get("e0", 1)) == 1)
+        self.dot_s2.set_live(connected and "s1" in values and int(values.get("e1", 1)) == 1)
         # dmp defaults to 1 for older firmware that doesn't send the field
         self.dot_mpu.set_live(connected and "q0" in values and int(values.get("dmp", 1)) == 1)
 
     def start_calibration(self):
+        """Recalibrate at the source first: ask the ESP32 to re-run its
+        accel/gyro bias calibration ('cal'), then re-zero the displayed raw
+        counts once it's done. Falls back to display-only zeroing when the
+        link can't carry the command (e.g. legacy Wi-Fi sensor mode)."""
+        if self.listener.is_connected() and self.listener.send_line("cal"):
+            self._cal_waiting_device = True
+            self._cal_sent_at = time.monotonic()
+            self.calib_left = 0          # cancel any local averaging in progress
+            self.calib_status_label.setText(
+                "Recalibrating biases on the ESP32 - keep the sensor still "
+                "(telemetry pauses ~2 s)...")
+        else:
+            self._begin_local_zero()
+
+    def _begin_local_zero(self):
         """Begin averaging the next CALIB_SAMPLES fresh packets into a new zero baseline."""
         _, last_seen = self.listener.snapshot()
-        self.calib_accum = {name: 0 for name in SENSORS}
+        self.calib_accum = {name: 0 for name in CALIB_SENSORS}
         self.calib_left = CALIB_SAMPLES
         self._calib_last_seen = last_seen  # only count packets newer than this
         self.calib_status_label.setText("Calibrating... hold the sensor still")
@@ -1069,25 +1289,50 @@ class MonitorWindow(QMainWindow):
 
         values, last_seen = self.listener.snapshot()
         self._update_status_dots(values, connected)   # from the raw snapshot (all fields)
-        have_full = bool(values) and all(name in values for name in SENSORS)
+        have_full = bool(values) and all(name in values for name in CALIB_SENSORS)
+        quat = (tuple(float(values[k]) for k in QUAT)
+                if all(k in values for k in QUAT) else None)
+
+        # device-side calibration in flight: wait for the ESP32's cal reply,
+        # then re-zero the display against the freshly calibrated stream
+        if self._cal_waiting_device:
+            reply, ts = self.listener.control("cal:")
+            if reply == "cal:done" and ts >= self._cal_sent_at:
+                self._cal_waiting_device = False
+                self._begin_local_zero()
+            elif reply and reply.startswith("cal:error") and ts >= self._cal_sent_at:
+                self._cal_waiting_device = False
+                self._begin_local_zero()
+                self.calib_status_label.setText(
+                    f"ESP32 refused ({reply}) - zeroing the display only.")
+            elif time.monotonic() - self._cal_sent_at > DEVICE_CAL_TIMEOUT:
+                self._cal_waiting_device = False
+                self._begin_local_zero()
+                self.calib_status_label.setText(
+                    "No cal reply from the ESP32 - zeroing the display only.")
 
         # recalibration: accumulate only fresh, complete packets, then lock in offsets
         if self.calib_left > 0 and have_full and last_seen != self._calib_last_seen:
             self._calib_last_seen = last_seen
-            for name in SENSORS:
+            for name in CALIB_SENSORS:
                 self.calib_accum[name] += values[name]
             self.calib_left -= 1
             if self.calib_left == 0:
                 self.offsets = {name: round(self.calib_accum[name] / CALIB_SAMPLES)
-                                for name in SENSORS}
+                                for name in CALIB_SENSORS}
+                if quat:
+                    self._euler_zero = quat_to_euler(*quat)   # zero pose for the angle table
                 self.calib_status_label.setText("Calibrated. New zero set.")
             else:
                 self.calib_status_label.setText(
                     f"Calibrating... {CALIB_SAMPLES - self.calib_left}/{CALIB_SAMPLES}")
 
         # subtract the zero baseline before anything downstream sees the values
+        # (`values` is the snapshot's copy, so mutating it is safe; temperature
+        # and the quaternion pass through un-zeroed)
         if have_full:
-            values = {name: values[name] - self.offsets[name] for name in SENSORS}
+            for name in CALIB_SENSORS:
+                values[name] -= self.offsets[name]
 
         sample = self.clean.update(values, last_seen)
         for i, name in enumerate(SENSORS):
@@ -1096,7 +1341,7 @@ class MonitorWindow(QMainWindow):
             else:
                 self.table.item(i, 1).setText("-")
             conv_item = self.table.item(i, 2)
-            if sample.has_data:
+            if sample.has_data and name in sample.raw:
                 conv_item.setText(format_converted(name, sample.raw[name]))
                 conv_item.setForeground(QColor(COLOR_ASSUMED if sample.assumed else COLOR_REAL))
             else:
@@ -1104,33 +1349,41 @@ class MonitorWindow(QMainWindow):
                 conv_item.setForeground(QColor(COLOR_NODATA))
 
         if sample.has_data:
-            self.charts.add_sample(sample.converted)
+            for name, spark in self.sparks.items():
+                if name in sample.converted:
+                    spark.add_value(sample.converted[name][0])
 
-    def check_port(self):
-        port = UDP_PORT
-        users = find_port_users(port)
-        me = os.getpid()
+        self._update_angle_table(quat, values, connected)
 
-        if not users:
-            self.port_result_label.setText(f"Port {port} is FREE.")
-            self.kill_cmd_edit.setText("")
+    def _update_angle_table(self, quat, values, connected):
+        """Show roll/pitch/yaw relative to the captured zero pose, and the die
+        temperature change since the first reading (green while live, red when
+        the value is stale, grey before any data)."""
+        color = QColor(COLOR_REAL if connected else COLOR_ASSUMED)
+
+        if quat is None:
+            for i in range(3):
+                item = self.angle_table.item(i, 1)
+                item.setText("-")
+                item.setForeground(QColor(COLOR_NODATA))
         else:
-            summary = ", ".join(f"PID {pid} ({name})" for pid, name in users)
-            if len(users) == 1 and int(users[0][0]) == me:
-                self.port_result_label.setText(f"Port {port} is in use by THIS GUI (PID {me}) - expected.")
-            else:
-                self.port_result_label.setText(f"Port {port} in use by: {summary}")
+            current = quat_to_euler(*quat)
+            zero = self._euler_zero or (0.0, 0.0, 0.0)
+            for i, (cur, ref) in enumerate(zip(current, zero)):
+                item = self.angle_table.item(i, 1)
+                item.setText(f"{wrap180(cur - ref):+.1f} deg")
+                item.setForeground(color)
 
-            others = [pid for pid, _ in users if int(pid) != me]
-            if others:
-                self.kill_cmd_edit.setText("taskkill /F " + " ".join(f"/PID {pid}" for pid in others))
-            else:
-                self.kill_cmd_edit.setText("")
-
-    def copy_kill_cmd(self):
-        cmd = self.kill_cmd_edit.text()
-        if cmd:
-            QApplication.clipboard().setText(cmd)
+        temp_item = self.angle_table.item(3, 1)
+        if "tp" in values:
+            temp_c = convert("tp", values["tp"])[0]
+            if self._temp_base is None:
+                self._temp_base = temp_c
+            temp_item.setText(f"{temp_c - self._temp_base:+.2f} °C")
+            temp_item.setForeground(color)
+        else:
+            temp_item.setText("-")
+            temp_item.setForeground(QColor(COLOR_NODATA))
 
     def closeEvent(self, event):
         try:
