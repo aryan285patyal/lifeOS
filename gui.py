@@ -439,14 +439,21 @@ class ConnectionManager:
 
 
 class StretchTabBar(QTabBar):
-    """Tab bar whose tabs divide the full widget width equally, so the tab
-    selectors span the entire window instead of hugging the top-left."""
+    """Tab bar whose tabs always split the full bar width into equal parts, so
+    the selector row covers the window edge-to-edge with equal-width tabs
+    (leftover pixels from the division go to the leftmost tabs)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setUsesScrollButtons(False)
+        self.setElideMode(Qt.ElideRight)   # squeeze labels instead of scrolling
 
     def tabSizeHint(self, index):
         hint = super().tabSizeHint(index)
         count = self.count()
-        if count > 0:
-            hint.setWidth(max(hint.width(), self.width() // count))
+        if count > 0 and self.width() > 0:
+            width, extra = divmod(self.width(), count)
+            hint.setWidth(width + (1 if index < extra else 0))
         return hint
 
 
@@ -512,8 +519,9 @@ class OrientationBridge(QObject):
     zeroRequested = Signal()                           # "Zero / Level" pressed
 
 
-class VisualizerTab(QWidget):
-    """A QWebEngineView hosting the three.js scene, fed the device quaternion."""
+class VisualizerPanel(QWidget):
+    """A QWebEngineView hosting the three.js scene, fed the device quaternion.
+    Embedded in the Monitor tab below the relative-state table."""
 
     def __init__(self, listener):
         super().__init__()
@@ -1197,6 +1205,12 @@ class MonitorWindow(QMainWindow):
             + 2 * self.angle_table.frameWidth())
         layout.addWidget(self.angle_table)
 
+        # --- 3D orientation view, right below the relative-state table (takes
+        # any spare vertical space; the tables above keep their natural size) ---
+        self.visualizer = VisualizerPanel(self.listener)
+        self.visualizer.setMinimumHeight(240)
+        layout.addWidget(self.visualizer, 1)
+
         # --- Reset / recalibrate (zero the sensor) ---
         self.reset_btn = QPushButton("Reset / Recalibrate")
         self.reset_btn.clicked.connect(self.start_calibration)
@@ -1210,12 +1224,14 @@ class MonitorWindow(QMainWindow):
         central_widget.setLayout(layout)
 
         tabs = QTabWidget()
-        tabs.setTabBar(StretchTabBar())        # tabs span the full window width
+        tabs.setTabBar(StretchTabBar())
+        # Document mode hands the tab bar the QTabWidget's full width (instead
+        # of shrink-wrapping it to the tabs); StretchTabBar then splits that
+        # width equally, so the selectors cover the window edge-to-edge.
+        tabs.setDocumentMode(True)
         self.connect_tab = ConnectTab(self.listener)
         tabs.addTab(self.connect_tab, "Connect")
         tabs.addTab(central_widget, "Monitor")
-        self.visualizer = VisualizerTab(self.listener)
-        tabs.addTab(self.visualizer, "Visualizer")
         self.servos = ServoTab(self.listener)
         tabs.addTab(self.servos, "Servos")
         self.hand_model = HandModelTab()

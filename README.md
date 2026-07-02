@@ -40,10 +40,10 @@ Wi-Fi video).
 | File | Role |
 | --- | --- |
 | `lifeOs.ino` | ESP32 firmware. MPU6050 DMP + servos, Bluetooth sensor/control link, Wi-Fi video on demand. |
-| `gui.py` | PySide6 app: Connect / Monitor / Visualizer / Servos / Hand Model tabs + status bar. |
+| `gui.py` | PySide6 app: Connect / Monitor / Servos / Hand Model tabs + status bar (3D visualizer lives in Monitor). |
 | `CleanInput.py` | Cleans the packet stream, converts raw counts to physical units. |
 | `live_charts.py` | Scrolling Qt charts for the Monitor tab. |
-| `web/` | Vendored three.js scene for the Visualizer. |
+| `web/` | Vendored three.js scene for the Monitor tab's 3D view. |
 | `bt_receiver.py` | Minimal terminal receiver for the Bluetooth sensor link. |
 | `wifi_video_test.py` | Provisions Wi-Fi over Bluetooth and measures the video UDP stream. |
 | `reciever.py` | Legacy terminal receiver for the old Wi-Fi/UDP sensor mode. |
@@ -91,10 +91,9 @@ python gui.py
   `lifeos` COM port (**Find lifeOs port** auto-detects it), Connect, Save default.
   *Wi-Fi (video)*: enter SSID/password, confirm the auto-filled laptop IP,
   Connect (creds sent over Bluetooth), Save default.
-- **Monitor** — connection status, raw/converted table, live charts, Reset /
-  Recalibrate.
-- **Visualizer** — a 3D model that rotates with the device; **Zero / Level**
-  cancels the resting pose (three.js in a `QWebEngineView`).
+- **Monitor** — connection status, raw/converted table, live charts, a 3D model
+  that rotates with the device (three.js in a `QWebEngineView`; **Zero / Level**
+  cancels the resting pose), Reset / Recalibrate.
 - **Servos** — sliders/spinboxes to set angles + dials that follow the echoed
   angles (true device state).
 - **Status bar (bottom-left)** — colored ✓/✗ boxes for **BT** (blue), **WiFi**

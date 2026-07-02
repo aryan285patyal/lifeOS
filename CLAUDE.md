@@ -12,7 +12,7 @@ plots the data, commands the servos, and manages connectivity. The ESP32 runs
 - **Bluetooth Classic SPP (always on)** — sensor telemetry out (quaternion + raw
   counts + servo echo + health flags), servo commands in, an `id?` identity
   reply, and Wi-Fi **provisioning** in. Network-independent; keeps the laptop's
-  Wi-Fi free. This is the link the Monitor/Visualizer/Servos tabs read from.
+  Wi-Fi free. This is the link the Monitor/Servos tabs read from.
 - **Wi-Fi station (on demand)** — high-bandwidth **video** over UDP. Brought up
   only after the laptop sends Wi-Fi credentials + its own current IP over
   Bluetooth, so a changing laptop DHCP address is handled every session and
@@ -21,11 +21,11 @@ plots the data, commands the servos, and manages connectivity. The ESP32 runs
 
 Files:
 - `lifeOs.ino` — firmware (MPU6050 DMP + servos + BT sensor link + Wi-Fi video).
-- `gui.py` — PySide6 app: **Connect**, **Monitor**, **Visualizer**, **Servos**
-  tabs, plus a bottom-left status bar.
+- `gui.py` — PySide6 app: **Connect**, **Monitor** (with embedded 3D
+  visualizer), **Servos**, **Hand Model** tabs, plus a bottom-left status bar.
 - `CleanInput.py`, `live_charts.py` — packet cleaning / unit conversion + the
   per-sensor `Sparkline` widgets used in the Monitor table.
-- `web/` — vendored three.js scene for the Visualizer.
+- `web/` — vendored three.js scene for the Monitor tab's 3D view.
 - `reciever.py` — legacy terminal receiver (old Wi-Fi/UDP sensor mode).
 - `bt_receiver.py` — terminal receiver for the Bluetooth sensor link.
 - `wifi_video_test.py` — provisions over BT and measures the Wi-Fi video stream.
@@ -79,7 +79,7 @@ prefix for `Link.control()`.
     Connect (sends creds over the active BT link), Disconnect (sends
     `wifi:off`), Save as default.
   - Saved defaults auto-connect BT and auto-provision video on launch.
-- **Monitor / Visualizer / Servos** — read through a `ConnectionManager` and are
+- **Monitor / Servos** — read through a `ConnectionManager` and are
   transport-agnostic.
   - Monitor's table rows are interleaved per axis — ax, gx, ay, gy, az, gz,
     temp — with a 4th **History** column: one autoscaled `Sparkline` per row
@@ -93,7 +93,8 @@ prefix for `Link.control()`.
   - Monitor's **Reset / Recalibrate** sends `cal` (device bias recalibration),
     waits for `cal:done` (timeout `DEVICE_CAL_TIMEOUT`), then averages
     `CALIB_SAMPLES` packets into a receiver-side zero for the raw counts.
-  - Visualizer de-drifts yaw: while the raw counts say the sensor is still, yaw
+  - The 3D view (`VisualizerPanel`, embedded in Monitor below the relative-state
+    table) de-drifts yaw: while the raw counts say the sensor is still, yaw
     change is treated as drift, frozen out, and the creep rate is learned (and
     subtracted during motion). Its **Zero** button cancels heading only
     (swing-twist), keeping gravity-true roll/pitch.
@@ -165,9 +166,9 @@ section → SSID/password → Connect. Verify video with
 
 ## Notes
 
-- Yaw drifts (no magnetometer); roll/pitch stable. Mitigations: the
-  Visualizer's stillness-based yaw de-drift, its heading-only Zero button, and
-  Monitor's Reset/Recalibrate (`cal`). Only a magnetometer would eliminate it.
+- Yaw drifts (no magnetometer); roll/pitch stable. Mitigations: the 3D view's
+  stillness-based yaw de-drift, its heading-only Zero button, and Monitor's
+  Reset/Recalibrate (`cal`). Only a magnetometer would eliminate it.
 - The saved Wi-Fi password lives in `connect_config.json` (gitignored, plaintext).
 - PC tools target Windows (`netstat`/`tasklist`; `reciever.py` uses `msvcrt`).
 - PySide6 is pinned to 6.8.0.2 (newer needs an MSVC runtime some Python builds
