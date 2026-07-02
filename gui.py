@@ -456,6 +456,16 @@ class StretchTabBar(QTabBar):
             hint.setWidth(width + (1 if index < extra else 0))
         return hint
 
+    def minimumTabSizeHint(self, index):
+        # Qt's default minimum is derived from tabSizeHint, which here equals
+        # width/count -- that pins the bar's minimum width to its CURRENT width,
+        # so the window can never shrink and Windows frame rounding then grows
+        # it a few px per layout pass, forever. Keep the minimum small instead;
+        # labels elide when the window really is that narrow.
+        hint = super().minimumTabSizeHint(index)
+        hint.setWidth(48)
+        return hint
+
 
 class DeviceDiscovery(ServiceListener):
     """Live mDNS browser for the ESP32's _lifeos._udp service. Keeps a running
