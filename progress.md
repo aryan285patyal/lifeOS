@@ -115,7 +115,7 @@ designDecisions.md, and to-do.md.
   root cause of roll/pitch decaying toward wrong angles; six-position
   calibration measures true ±1g per axis with no flatness assumption (§13
   context, to-do.md notes).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
 
 ## 2026-07-07 — 6-point calibration: explicit step-per-face flow
 - **What:** The wizard now prompts one face at a time in a fixed order; the
@@ -125,7 +125,7 @@ designDecisions.md, and to-do.md.
 - **Why:** v1's auto-detect made each step implicit — the user couldn't tell
   which face was being measured or when; explicit steps also average 10× more
   samples per face (§13).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
 
 ## 2026-07-07 — Flip column in the relative-state table
 - **What:** Third column of Monitor's second table: a checkbox per row (Roll /
@@ -135,7 +135,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Mounting orientation decides each axis's sign — an inverted mount
   reads "tilt up" as negative; a display-side flip fixes it without touching
   firmware (§14).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
 
 ## 2026-07-07 — Launch maximized; standard restore size
 - **What:** The GUI opens maximized (normal frame, title-bar buttons visible);
@@ -143,7 +143,7 @@ designDecisions.md, and to-do.md.
   centered, ignoring Qt's remembered geometry.
 - **Why:** The window sometimes opened with glitched oversized geometry, hiding
   the minimize/restore/close buttons and the drag area off-screen (§15).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
 
 ## 2026-07-07 — Documentation upkeep rules + this progress log
 - **What:** CLAUDE.md now mandates: designDecisions.md entry whenever a
@@ -153,7 +153,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Several changes had landed without designDecisions.md entries; a
   single changelog with push status shows at a glance what exists and what has
   reached GitHub.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
 
 ## 2026-07-07 — Git convention: no Claude co-author trailer
 - **What:** CLAUDE.md now instructs that commits made through Claude must
@@ -161,4 +161,4 @@ designDecisions.md, and to-do.md.
   flags get flipped after each push.
 - **Why:** GitHub renders the trailer as a co-author badge; the user wants
   commits to show only them.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (92fde26)
