@@ -30,6 +30,9 @@ Files:
 - `bt_receiver.py` — terminal receiver for the Bluetooth sensor link.
 - `wifi_video_test.py` — provisions over BT and measures the Wi-Fi video stream.
 - `designDecisions.md` — rationale for the architecture.
+- `progress.md` — changelog: every change with description, reason, timestamp,
+  and a pushed-to-GitHub flag.
+- `to-do.md` — living task list.
 
 ## Wire protocol
 
@@ -40,7 +43,10 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:
 ```
 
 - `q0..q3` — fused DMP quaternion (w, x, y, z), floats.
-- `ax..gz` — raw accel/gyro counts (converted on the PC).
+- `ax..gz` — raw accel/gyro counts read from the sensor's **data registers**
+  (converted on the PC). Never read these from the DMP FIFO: its "accel" bytes
+  are a DMP-internal filtered quantity that only equals gravity when flat and
+  collapses toward zero when rotated (measured ~0.03g total while inverted).
 - `tp` — raw die-temperature counts (°C = raw/340 + 36.53, converted on the
   PC). Optional: the GUI tolerates firmware that doesn't send it.
 - `s0..s1` — servo angles the ESP32 holds (echoed back).
@@ -49,15 +55,29 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:
 - `wf` — 1 if Wi-Fi video is streaming (drives the Wi-Fi status dot).
 
 `q*` parse as float, everything else int. Non-telemetry replies (`cal:*`,
-`wifi:*`, `id:*`) arrive on the same stream; `Link._ingest` stashes them per
-prefix for `Link.control()`.
+`acal:*`, `wifi:*`, `id:*`) arrive on the same stream; `Link._ingest` stashes
+them per prefix for `Link.control()`.
 
 **Control lines PC→ESP32 (Bluetooth):**
 - `s0:90,s1:45` — servo command.
 - `e0:1,e1:0` — enable/disable individual servos (0 detaches the pin → limp;
   re-enable restores the last commanded angle).
-- `cal` — re-run the MPU6050 accel/gyro bias calibration (hold the sensor
-  still; replies `cal:start` then `cal:done`; telemetry pauses ~2 s).
+- `cal` — re-run the MPU6050 **gyro** bias calibration (hold the sensor still,
+  any orientation; replies `cal:start` then `cal:done`; telemetry pauses ~2 s).
+  Accel offsets are never touched: the library's `CalibrateAccel()` is broken
+  (Electronic Cats v1.4.4 drives flat Z to 2g instead of 1g — measured; the
+  resulting +1g Z offset bias is what made DMP roll/pitch decay toward wrong
+  angles). Accel bias comes only from `acal:set` or factory trim; boot no
+  longer runs `CalibrateAccel` either.
+- `acal:set,<bx>,<by>,<bz>` — six-position accel calibration: per-axis bias in
+  raw ±2g counts (solved by the GUI wizard). Converted to offset-register units
+  (÷8, bit 0 of each register preserved — factory temp-compensation bit),
+  written to the MPU so the DMP fuses against true gravity, and persisted in
+  ESP32 NVS (re-applied every boot, which then skips `CalibrateAccel` and runs
+  `CalibrateGyro` only). Replies `acal:ok,<ox>,<oy>,<oz>` (register values) or
+  `acal:error,...`.
+- `acal:clear` — drop the stored offsets (reply `acal:cleared`); next boot
+  reverts to the automatic flat calibration.
 - `id?` → ESP32 replies `id:lifeos,proto:1,servos:2` (used to auto-detect the
   lifeOs COM port).
 - `wifi:<ssid>|<password>|<laptop_ip>` — provision Wi-Fi; the ESP32 joins that
@@ -89,10 +109,24 @@ prefix for `Link.control()`.
     table shows roll/pitch/yaw **relative to the zero pose** (captured when
     Reset / Recalibrate locks in; before that, relative to the DMP startup
     pose) plus **Delta Temp**, the die-temperature change since the first
-    reading of the session (recalibrate once it flattens).
+    reading of the session (recalibrate once it flattens). Its third **Flip**
+    column has a checkbox per row that negates that row's value (mounting
+    orientation); the roll/pitch/yaw flips also mirror the 3D view, and the
+    set persists in `calibration.json` (`value_flips`).
   - Monitor's **Reset / Recalibrate** sends `cal` (device bias recalibration),
     waits for `cal:done` (timeout `DEVICE_CAL_TIMEOUT`), then averages
     `CALIB_SAMPLES` packets into a receiver-side zero for the raw counts.
+  - Monitor's **6-Point Calibration…** opens `SixPointCalDialog`: it walks the
+    six faces in a fixed order, prompting one at a time — the user places that
+    face up, presses **Calibrate** (enabled only while the prompted face is
+    detected up and still, `SIXCAL_*` constants), and readings are averaged
+    for `SIXCAL_CAPTURE_SECS` (10 s; movement aborts that face for a retry)
+    before the next face is prompted — then it solves per-axis accel
+    bias `(r₊+r₋)/2` and scale `(r₊−r₋)/(2·16384)`, sends the bias via
+    `acal:set`, and saves the scale to `calibration.json` (gitignored), which
+    `CleanInput.set_accel_scale` applies to converted g values at startup.
+    Fixes the roll/pitch decay-to-wrong-angle bug (tilted `CalibrateAccel`
+    corrupting offsets → DMP pulled toward a biased gravity vector).
   - The 3D view (`VisualizerPanel`, embedded in Monitor below the relative-state
     table) de-drifts yaw: while the raw counts say the sensor is still, yaw
     change is treated as drift, frozen out, and the creep rate is learned (and
@@ -107,6 +141,10 @@ prefix for `Link.control()`.
 - **Status bar (bottom-left)** — colored `StatusDot` boxes (BT blue, Wi-Fi green,
   Servo1/Servo2 red, MPU yellow) showing ✓/✗ by whether that source had a live
   signal in the last second (all derived from the fresh BT telemetry line).
+- **Window sizing** — launches maximized (normal frame, title-bar buttons
+  visible); "restore down" always lands on `RESTORED_SIZE` clamped to the
+  current monitor and centered (`changeEvent` override), never Qt's remembered
+  geometry — guards against the off-screen-title-bar glitch.
 
 ## Code structure (gui.py)
 
@@ -163,6 +201,26 @@ Typical flow: Connect tab → Bluetooth → Find lifeOs port → Connect; then W
 section → SSID/password → Connect. Verify video with
 `python wifi_video_test.py [--com COMx --ssid X --password Y]` (allow inbound UDP
 5010 in the firewall).
+
+## Documentation upkeep (required with every change)
+
+- **`designDecisions.md`** — whenever a design decision is locked in (behavior,
+  UX flow, persistence location, protocol, sizing policy, ...), append a
+  numbered **Decision / Why** entry (newest at the bottom), including what it
+  supersedes. Settled questions must not be relitigated from scratch.
+- **`progress.md`** — append an entry for every change: a short **What**, a
+  one-line **Why**, a timestamp heading, and a **Pushed** flag. Use
+  `no (uncommitted)` until the work lands on GitHub, then flip it to
+  `yes (<sha>)`.
+- **`to-do.md`** — keep current: add items as they come up, check them off
+  (with a date) when done.
+
+## Git conventions
+
+- **Never add a `Co-Authored-By: Claude` trailer** (or any co-author tag) to
+  commit messages when committing or pushing — commits must show only the
+  user. This is an explicit standing instruction from the user.
+- After pushing, flip the affected progress.md entries to `yes (<sha>)`.
 
 ## Notes
 

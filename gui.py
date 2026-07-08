@@ -11,8 +11,9 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QLineEdit, QPushButton, QTabWidget, QTabBar, QSlider, QSpinBox, QDial,
     QGroupBox, QListWidget, QListWidgetItem, QCheckBox, QComboBox, QStackedWidget,
+    QDialog,
 )
-from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal
+from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal, QEvent
 from PySide6.QtGui import QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
@@ -24,7 +25,7 @@ except ImportError:                       # GUI still runs; Hand Model tab degra
     HAVE_MULTIMEDIA = False
 from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
-from CleanInput import CleanInput, convert, format_converted
+from CleanInput import CleanInput, convert, format_converted, set_accel_scale
 from live_charts import sparkline_for
 
 QUAT = ["q0", "q1", "q2", "q3"]
@@ -33,6 +34,12 @@ QUAT = ["q0", "q1", "q2", "q3"]
 SENSORS = ["ax", "gx", "ay", "gy", "az", "gz", "tp"]
 # The axes Reset / Recalibrate zeroes (temperature has no meaningful zero).
 CALIB_SENSORS = ["ax", "ay", "az", "gx", "gy", "gz"]
+
+# The window launches maximized; pressing "restore down" always lands on this
+# size (clamped to the screen and centered) instead of whatever geometry Qt
+# remembers - guards against the runaway/off-screen geometry glitch that hid
+# the title-bar buttons.
+RESTORED_SIZE = (720, 860)
 
 NUM_SERVOS = 2                        # must match NUM_SERVOS in lifeOs.ino
 SERVO_GPIOS = [13, 25]               # for display only; matches SERVO_PINS in firmware
@@ -59,6 +66,29 @@ def save_connect_config(cfg):
     try:
         with open(CONNECT_CONFIG, "w") as f:
             json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+# Per-device 6-position calibration results. Accel bias lives in the MPU's
+# hardware offset registers (persisted on the ESP32 in NVS); this file carries
+# the PC-side scale factors (plus the solved bias, for reference) and the
+# Monitor tab's per-axis "value_flips" (mounting-orientation sign flips).
+CALIBRATION_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+
+
+def load_calibration():
+    try:
+        with open(CALIBRATION_CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_calibration(cal):
+    try:
+        with open(CALIBRATION_CONFIG, "w") as f:
+            json.dump(cal, f, indent=2)
     except Exception:
         pass
 
@@ -102,6 +132,22 @@ def quat_to_euler(w, x, y, z):
     cosy_cosp = 1 - 2 * (y * y + z * z)
     yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
     return roll, pitch, yaw
+
+
+def euler_to_quat(roll, pitch, yaw):
+    """(roll, pitch, yaw) in degrees -> quaternion (w,x,y,z); the inverse of
+    quat_to_euler (same ZYX convention). Used to rebuild an orientation after
+    negating flipped Euler components."""
+    hr = math.radians(roll) / 2
+    hp = math.radians(pitch) / 2
+    hy = math.radians(yaw) / 2
+    cr, sr = math.cos(hr), math.sin(hr)
+    cp, sp = math.cos(hp), math.sin(hp)
+    cy, sy = math.cos(hy), math.sin(hy)
+    return (cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy)
 
 
 def wrap180(deg):
@@ -187,6 +233,19 @@ def probe_lifeos_port(timeout=1.5, skip=None):
 CALIB_SAMPLES = 20          # fresh samples averaged into the zero baseline on reset
 DEVICE_CAL_TIMEOUT = 10.0   # seconds to wait for the ESP32's cal:done reply
 
+# Six-position accel calibration wizard (raw counts; DMP accel FSR ±2g).
+# Looser than the visualizer's stillness gate: the sensor is hand-held or
+# propped for most faces, so hand tremor must pass; the 10-second average
+# smooths what the gate lets through. Tilt tolerance costs only cos(theta)
+# (second order: ~17 deg -> ~1-2% scale error), far below the bug being fixed.
+SIXCAL_G_COUNTS = 16384       # nominal raw counts per g
+SIXCAL_STILL_GYRO = 150       # per-axis |gyro| counts (~9 °/s): tremor-tolerant
+SIXCAL_DOM_TOL = 0.25         # vertical axis must be within ±25% of 1g
+SIXCAL_LAT_MAX = 4915         # the two horizontal axes must stay below ~0.3g
+SIXCAL_CAPTURE_SECS = 10.0    # per-face averaging window after Calibrate is pressed
+SIXCAL_MIN_SAMPLES = 100      # fewer fresh samples than this in the window = abort
+SIXCAL_REPLY_TIMEOUT = 5.0    # seconds to wait for the ESP32's acal reply
+
 # Stillness detection for the Visualizer's yaw de-drift, on the raw counts
 # (DMP full scales: accel +/-2g -> 16384 LSB/g, gyro +/-2000 dps -> 16.4 LSB/dps).
 STILL_GYRO_COUNTS = 60      # per-axis |gyro| below this (~3.7 deg/s) = not rotating
@@ -214,7 +273,7 @@ class Link:
     source differs. Subclasses implement start/stop/send_servos/description."""
 
     # non-telemetry replies the ESP32 sends over the same stream, kept per prefix
-    CONTROL_PREFIXES = ("cal:", "wifi:", "id:")
+    CONTROL_PREFIXES = ("cal:", "acal:", "wifi:", "id:")
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -554,6 +613,11 @@ class VisualizerPanel(QWidget):
         self.zero_btn.clicked.connect(lambda: self.bridge.zeroRequested.emit())
         layout.addWidget(self.zero_btn)
 
+        # Per-axis sign flips (Monitor's angle-table "Flip" checkboxes): the
+        # emitted orientation has the flipped Euler components negated so the
+        # 3D view mirrors what the table shows.
+        self._flips = {"roll": False, "pitch": False, "yaw": False}
+
         # Yaw de-drift: yaw has no absolute reference (no magnetometer), so any
         # residual gyro-z bias shows as a slow spin. While the raw counts say the
         # sensor is physically still, any yaw change IS drift: freeze it out and
@@ -570,11 +634,32 @@ class VisualizerPanel(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start(33)
 
+    def set_flips(self, flips):
+        """Update the roll/pitch/yaw sign flips (keys as in self._flips)."""
+        for axis in self._flips:
+            self._flips[axis] = bool(flips.get(axis, False))
+
+    def _apply_flips(self, q):
+        """Negate the flipped Euler components of quaternion q. Round-trips
+        through Euler angles, so pitch ~ +/-90 is momentarily degenerate
+        (gimbal lock) - only while a flip is active."""
+        if not any(self._flips.values()):
+            return q
+        roll, pitch, yaw = quat_to_euler(*q)
+        if self._flips["roll"]:
+            roll = -roll
+        if self._flips["pitch"]:
+            pitch = -pitch
+        if self._flips["yaw"]:
+            yaw = -yaw
+        return euler_to_quat(roll, pitch, yaw)
+
     def _tick(self):
         values, _ = self.listener.snapshot()
         if values and all(k in values for k in QUAT):
             q = tuple(float(values[k]) for k in QUAT)
-            w, x, y, z = self._dedrift(q, values)
+            q = self._dedrift(q, values)
+            w, x, y, z = self._apply_flips(q)
             self.bridge.orientation.emit(w, x, y, z)
 
     def _is_still(self, values):
@@ -1132,6 +1217,273 @@ class HandModelTab(QWidget):
         self._session = None
 
 
+class SixPointCalDialog(QDialog):
+    """Guided six-position accelerometer calibration, one explicit step per
+    face: the wizard prompts a specific side to face up, the user places the
+    sensor and presses Calibrate, and readings are averaged for
+    SIXCAL_CAPTURE_SECS before the next face is prompted. Each axis then sees
+    exactly +1g and -1g, so per-axis bias = (r+ + r-)/2 and scale =
+    (r+ - r-)/(2*16384) with no flatness assumption. Bias is sent to the ESP32
+    ('acal:set', written to the MPU's hardware offset registers so the DMP
+    fuses against true gravity); scale is saved to calibration.json and applied
+    PC-side (the chip has no scale registers). Reads raw counts straight from
+    listener.snapshot()."""
+
+    AXES = ("ax", "ay", "az")
+    # (label, axis, sign of the reading when that side faces up)
+    FACES = [("+X", "ax", +1), ("-X", "ax", -1),
+             ("+Y", "ay", +1), ("-Y", "ay", -1),
+             ("+Z", "az", +1), ("-Z", "az", -1)]
+
+    def __init__(self, listener, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("6-Point Accelerometer Calibration")
+        self.setMinimumWidth(420)
+        self.listener = listener
+        self.succeeded = False
+        self.captures = {}          # (axis, sign) -> {axis: averaged raw counts}
+        self._face_name = {(a, s): n for n, a, s in self.FACES}
+        self._face_idx = 0          # index into FACES of the step being prompted
+        self._last_seen = None      # advance-only marker for fresh packets
+        self._ready = False         # last fresh sample matched the prompted face
+        self._why = "no telemetry yet"
+        self._notice = ""           # sticky note (abort reason) shown until retry
+        self._accum = None          # per-axis sums while capturing a face
+        self._accum_n = 0
+        self._capture_until = None  # monotonic deadline of the capture window
+        self._sent_at = None        # monotonic time acal:set went out
+        self._solution = None       # (bias, scale) once all six faces solve
+
+        layout = QVBoxLayout(self)
+        self.prompt = QLabel("")
+        self.prompt.setWordWrap(True)
+        layout.addWidget(self.prompt)
+
+        self.face_labels = {}
+        for name, axis, sign in self.FACES:
+            lbl = QLabel(f"–  {name} up: waiting")
+            self.face_labels[(axis, sign)] = lbl
+            layout.addWidget(lbl)
+
+        self.detail = QLabel("")    # solved numbers / live residual / errors
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+
+        self.cal_btn = QPushButton("Calibrate")
+        self.cal_btn.setEnabled(False)   # enabled once the prompted face is up
+        self.cal_btn.clicked.connect(self._start_capture)
+        layout.addWidget(self.cal_btn)
+
+        self.close_btn = QPushButton("Cancel")
+        self.close_btn.clicked.connect(self.reject)
+        layout.addWidget(self.close_btn)
+
+        self._show_step("waiting for telemetry")
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(50)
+
+    def _finish(self, prompt, detail=""):
+        """Terminal state (success shown elsewhere): stop polling, allow close."""
+        self.timer.stop()
+        self.cal_btn.setEnabled(False)
+        self.prompt.setText(prompt)
+        if detail:
+            self.detail.setText(detail)
+        self.close_btn.setText("Close")
+
+    def _show_step(self, status):
+        name = self.FACES[self._face_idx][0]
+        text = (f"Step {self._face_idx + 1} of {len(self.FACES)}: place the "
+                f"sensor with its {name} side facing straight up, hold it "
+                f"still, then press Calibrate "
+                f"({SIXCAL_CAPTURE_SECS:.0f} s of readings).")
+        if self._notice:
+            text += f"\n{self._notice}"
+        text += f"\n{status}"
+        self.prompt.setText(text)
+
+    def _poll(self):
+        if self._sent_at is not None:
+            self._poll_reply()
+            return
+        values, last_seen = self.listener.snapshot()
+        fresh = (last_seen != self._last_seen
+                 and all(k in values for k in CALIB_SENSORS))
+        if not fresh:
+            if not self.listener.is_connected(timeout=3.0) and not self.succeeded:
+                self.prompt.setText("No telemetry - reconnect Bluetooth, then "
+                                    "close and reopen this wizard.")
+            return
+        self._last_seen = last_seen
+        if self.succeeded:
+            bias, scale = self._solution
+            self.detail.setText(
+                self._numbers_text(bias, scale)
+                + f"\nLive counts: ax {values['ax']:+d}  ay {values['ay']:+d}"
+                  f"  az {values['az']:+d}"
+                + "\n(the vertical axis should read about ±16384, the "
+                  "other two near 0)")
+            return
+        pose, why = self._detect_pose(values)
+        gyro_max = max(abs(values[g]) for g in ("gx", "gy", "gz"))
+        self.detail.setText(
+            f"Live: ax {values['ax']:+d}  ay {values['ay']:+d}"
+            f"  az {values['az']:+d}  |  gyro max {gyro_max}"
+            f" (limit {SIXCAL_STILL_GYRO})")
+        if self._capture_until is not None:
+            self._capture_step(values, pose)
+        else:
+            self._wait_step(pose, why)
+
+    def _detect_pose(self, v):
+        """((axis, sign) of the face pointing up, None) — or (None, reason)
+        explaining which check rejected the sample."""
+        gyro_max = max(abs(v[g]) for g in ("gx", "gy", "gz"))
+        if gyro_max > SIXCAL_STILL_GYRO:
+            return None, (f"moving - gyro {gyro_max} counts, "
+                          f"needs < {SIXCAL_STILL_GYRO}")
+        axis = max(self.AXES, key=lambda a: abs(v[a]))
+        dom = v[axis]
+        if abs(abs(dom) - SIXCAL_G_COUNTS) > SIXCAL_DOM_TOL * SIXCAL_G_COUNTS:
+            return None, (f"no face straight up - strongest axis {axis} reads "
+                          f"{dom / SIXCAL_G_COUNTS:+.2f} g, needs ~±1 g")
+        lat = max((a for a in self.AXES if a != axis), key=lambda a: abs(v[a]))
+        if abs(v[lat]) > SIXCAL_LAT_MAX:
+            return None, (f"tilted - {lat} reads "
+                          f"{v[lat] / SIXCAL_G_COUNTS:+.2f} g, needs within "
+                          f"±{SIXCAL_LAT_MAX / SIXCAL_G_COUNTS:.2f} g")
+        return (axis, 1 if dom > 0 else -1), None
+
+    def _wait_step(self, pose, why):
+        """Between captures: track whether the prompted face is up (gates the
+        Calibrate button) and keep the step instructions current."""
+        name, axis, sign = self.FACES[self._face_idx]
+        if pose == (axis, sign):
+            self._ready, self._why = True, None
+            status = f"{name} up detected - press Calibrate."
+        else:
+            self._ready = False
+            if pose is not None:
+                self._why = f"{self._face_name[pose]} is up, not {name}"
+            else:
+                self._why = why
+            status = f"Not ready: {self._why}."
+        self.cal_btn.setEnabled(self._ready)
+        self._show_step(status)
+
+    def _start_capture(self):
+        if not self._ready:
+            return
+        self._notice = ""
+        self._accum = {a: 0 for a in self.AXES}
+        self._accum_n = 0
+        self._capture_until = time.monotonic() + SIXCAL_CAPTURE_SECS
+        self.cal_btn.setEnabled(False)
+
+    def _abort_capture(self, reason):
+        self._capture_until = None
+        self._accum = None
+        self._notice = f"Capture aborted - {reason} Press Calibrate to retry."
+
+    def _capture_step(self, values, pose):
+        name, axis, sign = self.FACES[self._face_idx]
+        if pose != (axis, sign):
+            self._abort_capture("the sensor moved.")
+            return
+        for a in self.AXES:
+            self._accum[a] += values[a]
+        self._accum_n += 1
+        left = self._capture_until - time.monotonic()
+        if left > 0:
+            self.prompt.setText(f"Capturing {name} up - keep still... "
+                                f"{left:.1f} s left ({self._accum_n} samples)")
+            return
+        if self._accum_n < SIXCAL_MIN_SAMPLES:
+            self._abort_capture(f"only {self._accum_n} samples arrived in "
+                                f"{SIXCAL_CAPTURE_SECS:.0f} s (telemetry too "
+                                "spotty).")
+            return
+        avg = {a: self._accum[a] / self._accum_n for a in self.AXES}
+        self.captures[(axis, sign)] = avg
+        self.face_labels[(axis, sign)].setText(
+            f"✓  {name} up: ax {avg['ax']:+.0f}  ay {avg['ay']:+.0f}"
+            f"  az {avg['az']:+.0f}")
+        self._capture_until = None
+        self._accum = None
+        self._face_idx += 1
+        if self._face_idx == len(self.FACES):
+            self._solve_and_send()
+        else:
+            self._notice = ""
+            self._ready = False
+            self._show_step("checking orientation...")
+
+    def _solve(self):
+        bias, scale, problems = {}, {}, []
+        for axis in self.AXES:
+            r_up = self.captures[(axis, +1)][axis]
+            r_down = self.captures[(axis, -1)][axis]
+            b = (r_up + r_down) / 2.0
+            s = (r_up - r_down) / (2.0 * SIXCAL_G_COUNTS)
+            if not 0.9 <= s <= 1.1:
+                problems.append(f"{axis} scale {s:.3f} outside 0.9-1.1")
+            if abs(b) > 3000:
+                problems.append(f"{axis} bias {b:+.0f} counts is too large")
+            bias[axis], scale[axis] = b, s
+        return bias, scale, problems
+
+    def _numbers_text(self, bias, scale):
+        return ("Bias (counts): "
+                + "  ".join(f"{a} {bias[a]:+.0f}" for a in self.AXES)
+                + "\nScale: "
+                + "  ".join(f"{a} {scale[a]:.4f}" for a in self.AXES))
+
+    def _solve_and_send(self):
+        bias, scale, problems = self._solve()
+        if problems:
+            self._finish("Measurements look wrong - nothing was sent to the "
+                         "ESP32. Reopen the wizard to retry.",
+                         "; ".join(problems))
+            return
+        self._solution = (bias, scale)
+        line = (f"acal:set,{round(bias['ax'])},{round(bias['ay'])},"
+                f"{round(bias['az'])}")
+        if not self.listener.send_line(line):
+            self._finish("Solved, but the link refused the command (Bluetooth "
+                         "down?). Nothing was saved.",
+                         self._numbers_text(bias, scale))
+            return
+        self._sent_at = time.monotonic()
+        self.prompt.setText("Sending offsets to the ESP32...")
+        self.detail.setText(self._numbers_text(bias, scale))
+
+    def _poll_reply(self):
+        reply, ts = self.listener.control("acal:")
+        if reply and ts >= self._sent_at:
+            self._sent_at = None
+            if reply.startswith("acal:ok"):
+                bias, scale = self._solution
+                cal = load_calibration()
+                cal["accel_scale"] = {a: round(scale[a], 5) for a in self.AXES}
+                cal["accel_bias_counts"] = {a: round(bias[a], 1) for a in self.AXES}
+                cal["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                save_calibration(cal)
+                set_accel_scale(cal["accel_scale"])
+                self.succeeded = True
+                self.close_btn.setText("Close")
+                self.prompt.setText(
+                    "Done. Bias offsets are on the ESP32 (kept across power "
+                    "cycles); scale factors saved to calibration.json.")
+            else:
+                self._finish(f"ESP32 refused: {reply}. Nothing was saved.")
+        elif time.monotonic() - self._sent_at > SIXCAL_REPLY_TIMEOUT:
+            self._sent_at = None
+            self._finish("No acal reply from the ESP32 - offsets may not be "
+                         "applied. Nothing was saved on the PC.")
+
+
 class StatusDot(QLabel):
     """A small colored box in the status bar. Its source color is fixed (so you
     can always tell which is which); a tick (live) or cross (no signal in the
@@ -1202,13 +1554,28 @@ class MonitorWindow(QMainWindow):
         # startup pose. ---
         self._euler_zero = None
         self._temp_base = None           # first temperature (degC) seen this session
-        self.angle_table = QTableWidget(4, 2)
-        self.angle_table.setHorizontalHeaderLabels(["Metric", "Delta from zero"])
+        self.angle_table = QTableWidget(4, 3)
+        self.angle_table.setHorizontalHeaderLabels(["Metric", "Delta from zero", "Flip"])
         self.angle_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.angle_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        for i, metric in enumerate(("Roll", "Pitch", "Yaw", "Delta Temp")):
+        # Per-row sign flips (mounting orientation): persisted in
+        # calibration.json and mirrored into the 3D view for the angle rows.
+        saved_flips = load_calibration().get("value_flips", {})
+        self.flip_boxes = {}
+        for i, (metric, key) in enumerate((("Roll", "roll"), ("Pitch", "pitch"),
+                                           ("Yaw", "yaw"), ("Delta Temp", "dtemp"))):
             self.angle_table.setItem(i, 0, QTableWidgetItem(metric))
             self.angle_table.setItem(i, 1, QTableWidgetItem("-"))
+            box = QCheckBox()
+            box.setChecked(bool(saved_flips.get(key, False)))
+            box.toggled.connect(self._flips_changed)
+            self.flip_boxes[key] = box
+            holder = QWidget()
+            hl = QHBoxLayout(holder)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setAlignment(Qt.AlignCenter)
+            hl.addWidget(box)
+            self.angle_table.setCellWidget(i, 2, holder)
         self.angle_table.setFixedHeight(
             self.angle_table.rowCount() * self.angle_table.verticalHeader().defaultSectionSize()
             + self.angle_table.horizontalHeader().sizeHint().height()
@@ -1219,12 +1586,18 @@ class MonitorWindow(QMainWindow):
         # any spare vertical space; the tables above keep their natural size) ---
         self.visualizer = VisualizerPanel(self.listener)
         self.visualizer.setMinimumHeight(240)
+        self.visualizer.set_flips(self._current_flips())
         layout.addWidget(self.visualizer, 1)
 
-        # --- Reset / recalibrate (zero the sensor) ---
+        # --- Reset / recalibrate (zero the sensor) + the six-position wizard ---
+        btn_row = QHBoxLayout()
         self.reset_btn = QPushButton("Reset / Recalibrate")
         self.reset_btn.clicked.connect(self.start_calibration)
-        layout.addWidget(self.reset_btn)
+        btn_row.addWidget(self.reset_btn)
+        self.sixcal_btn = QPushButton("6-Point Calibration...")
+        self.sixcal_btn.clicked.connect(self.open_six_point_cal)
+        btn_row.addWidget(self.sixcal_btn)
+        layout.addLayout(btn_row)
 
         self.calib_status_label = QLabel("Press Reset to zero the sensor (hold it still).")
         self.calib_status_label.setWordWrap(True)
@@ -1249,10 +1622,34 @@ class MonitorWindow(QMainWindow):
         self.setCentralWidget(tabs)
 
         self._build_status_bar()
+        self._apply_standard_size()   # the geometry "restore down" returns to
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh)
         self.timer.start(100)
+
+    def _apply_standard_size(self):
+        """Size the (non-maximized) window to RESTORED_SIZE clamped to the
+        current screen's available area, centered on that screen - so the
+        title bar and every control always stay reachable."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        self.resize(min(RESTORED_SIZE[0], avail.width()),
+                    min(RESTORED_SIZE[1], avail.height()))
+        frame = self.frameGeometry()
+        frame.moveCenter(avail.center())
+        self.move(frame.topLeft())
+
+    def changeEvent(self, event):
+        if (event.type() == QEvent.WindowStateChange
+                and event.oldState() & Qt.WindowMaximized
+                and not self.windowState()
+                & (Qt.WindowMaximized | Qt.WindowMinimized | Qt.WindowFullScreen)):
+            # "Restore down" pressed: after Qt applies the geometry it
+            # remembers (which may be the glitched oversized one), replace it
+            # with the standard size on whichever monitor the window is on.
+            QTimer.singleShot(0, self._apply_standard_size)
+        super().changeEvent(event)
 
     def _build_status_bar(self):
         """Bottom-left indicators, one colored box per source, tick/cross by
@@ -1281,6 +1678,18 @@ class MonitorWindow(QMainWindow):
         # dmp defaults to 1 for older firmware that doesn't send the field
         self.dot_mpu.set_live(connected and "q0" in values and int(values.get("dmp", 1)) == 1)
 
+    def _current_flips(self):
+        return {key: box.isChecked() for key, box in self.flip_boxes.items()}
+
+    def _flips_changed(self):
+        """A Flip checkbox toggled: persist the set and mirror the angle flips
+        into the 3D view."""
+        flips = self._current_flips()
+        cal = load_calibration()
+        cal["value_flips"] = flips
+        save_calibration(cal)
+        self.visualizer.set_flips(flips)
+
     def start_calibration(self):
         """Recalibrate at the source first: ask the ESP32 to re-run its
         accel/gyro bias calibration ('cal'), then re-zero the displayed raw
@@ -1295,6 +1704,21 @@ class MonitorWindow(QMainWindow):
                 "(telemetry pauses ~2 s)...")
         else:
             self._begin_local_zero()
+
+    def open_six_point_cal(self):
+        """Run the six-position accel calibration wizard (needs live BT
+        telemetry). On success the raw stream changes (new hardware offsets),
+        so the display zero is re-captured."""
+        if not self.listener.is_connected():
+            self.calib_status_label.setText(
+                "Connect over Bluetooth first - the 6-point wizard needs live telemetry.")
+            return
+        dlg = SixPointCalDialog(self.listener, self)
+        dlg.exec()
+        if dlg.succeeded:
+            self._begin_local_zero()
+            self.calib_status_label.setText(
+                "6-point calibration applied. Display zero re-captured.")
 
     def _begin_local_zero(self):
         """Begin averaging the next CALIB_SAMPLES fresh packets into a new zero baseline."""
@@ -1384,8 +1808,10 @@ class MonitorWindow(QMainWindow):
     def _update_angle_table(self, quat, values, connected):
         """Show roll/pitch/yaw relative to the captured zero pose, and the die
         temperature change since the first reading (green while live, red when
-        the value is stale, grey before any data)."""
+        the value is stale, grey before any data). Rows with Flip checked show
+        the negated delta."""
         color = QColor(COLOR_REAL if connected else COLOR_ASSUMED)
+        flips = self._current_flips()
 
         if quat is None:
             for i in range(3):
@@ -1395,9 +1821,13 @@ class MonitorWindow(QMainWindow):
         else:
             current = quat_to_euler(*quat)
             zero = self._euler_zero or (0.0, 0.0, 0.0)
-            for i, (cur, ref) in enumerate(zip(current, zero)):
+            for i, (key, cur, ref) in enumerate(
+                    zip(("roll", "pitch", "yaw"), current, zero)):
+                delta = wrap180(cur - ref)
+                if flips[key]:
+                    delta = -delta
                 item = self.angle_table.item(i, 1)
-                item.setText(f"{wrap180(cur - ref):+.1f} deg")
+                item.setText(f"{delta:+.1f} deg")
                 item.setForeground(color)
 
         temp_item = self.angle_table.item(3, 1)
@@ -1405,7 +1835,10 @@ class MonitorWindow(QMainWindow):
             temp_c = convert("tp", values["tp"])[0]
             if self._temp_base is None:
                 self._temp_base = temp_c
-            temp_item.setText(f"{temp_c - self._temp_base:+.2f} °C")
+            dtemp = temp_c - self._temp_base
+            if flips["dtemp"]:
+                dtemp = -dtemp
+            temp_item.setText(f"{dtemp:+.2f} °C")
             temp_item.setForeground(color)
         else:
             temp_item.setText("-")
@@ -1427,10 +1860,12 @@ def main():
     # QtWebEngine wants shared GL contexts set before the QApplication exists.
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
+    # 6-position accel scale factors from a previous calibration (bias is on
+    # the ESP32 itself, re-applied from NVS at every boot)
+    set_accel_scale(load_calibration().get("accel_scale", {}))
     manager = ConnectionManager()
     win = MonitorWindow(manager)
-    win.resize(720, 860)
-    win.show()
+    win.showMaximized()   # full working area, title-bar buttons always visible
     sys.exit(app.exec())
 
 

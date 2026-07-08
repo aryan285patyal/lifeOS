@@ -192,3 +192,52 @@ so the servo dots reflect "the ESP32 is reporting that servo's angle," not
 physical servo health. The source color is always shown (the two red servo boxes
 are told apart by their `S1`/`S2` captions); the glyph carries the live/dead
 state. `dmp` defaults to present-and-ok for older firmware that predates the flag.
+
+## 13. 6-point calibration: explicit step-per-face, not auto-detect
+
+**Decision:** The wizard walks the six faces in a **fixed order**: it prompts one
+face, the user places the sensor and presses **Calibrate**, and readings are
+averaged for **10 s** (`SIXCAL_CAPTURE_SECS`) before the next face is prompted.
+The button is enabled only while raw telemetry confirms the prompted face is up
+and still.
+
+**Why (supersedes the v1 any-order auto-detect):** v1 started capturing as soon
+as *any* uncaptured face was held up, which made each step implicit — the user
+couldn't tell which face was being measured or when. The explicit
+prompt → place → click → capture loop makes every axis's calibration a
+deliberate, visible act, and the 10 s window (~500 samples vs v1's ~1 s / 50)
+averages more tremor out. Pose detection is kept, but demoted from *trigger* to
+*gate*: it can no longer start a capture, only prevent capturing the wrong face;
+movement mid-window aborts just that face for a retry.
+
+## 14. Per-axis "Flip" checkboxes (mounting-orientation sign flips)
+
+**Decision:** The Monitor tab's relative-state table has a **Flip** column — one
+checkbox per row (Roll / Pitch / Yaw / Delta Temp) that negates that row's
+displayed value. The three angle flips also mirror the 3D visualizer; the set
+persists in `calibration.json` (`value_flips`).
+
+**Why:** How the MPU is mounted decides each axis's sign; when it's mounted
+inverted, "tilt up" reads negative. A per-axis display flip fixes that without
+touching firmware or the wire protocol. It lives in `calibration.json` because it
+is device/mounting configuration, like the accel scale. The visualizer flip is
+applied PC-side — quaternion → Euler, negate the flipped components, rebuild
+(`euler_to_quat`) — *before* the bridge emit, so the three.js page needs no
+changes and its Zero button still composes on top. Raw counts and the Servos
+mimic stay unflipped (they reflect the physical device). Known cost: with a flip
+active, the Euler round-trip is degenerate at pitch ±90° (momentary glitch).
+
+## 15. Window sizing: launch maximized; "restore down" = fixed standard size
+
+**Decision:** The GUI launches **maximized** (normal window frame, so
+minimize/restore/close stay visible). Pressing "restore down" always lands on
+`RESTORED_SIZE` (720×860) clamped to the current monitor's available area and
+centered — never the geometry Qt remembers.
+
+**Why:** The window sometimes opened with glitched oversized geometry: the title
+bar (and with it the buttons and the drag area) rendered off-screen, so the app
+could be neither moved nor closed (same family as the earlier runaway-growth bug,
+commit 606ae22). Maximizing is inherently screen-bounded, and overriding the
+restore geometry (via `changeEvent` on the maximized→normal transition) guards
+the one path that could reintroduce a bad remembered size — including when
+restoring on a different monitor than the one launched on.

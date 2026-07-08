@@ -13,11 +13,25 @@ TEMP = "tp"                # optional: MPU6050 die temperature, raw counts
 ACCEL_LSB_PER_G = 16384.0  # MPU6050 default full-scale +/-2 g
 GYRO_LSB_PER_DPS = 131.0   # MPU6050 default full-scale +/-250 deg/s
 
+# Per-axis accel scale factors from the 6-position calibration (true LSB/g =
+# nominal * factor). Bias lives in the MPU's hardware offset registers; scale
+# has no registers, so it's corrected here on the PC.
+_accel_scale = {"ax": 1.0, "ay": 1.0, "az": 1.0}
+
+
+def set_accel_scale(scale):
+    """Install 6-position accel scale factors ({'ax': s, ...}); ignores axes
+    that are missing or non-positive."""
+    for name in ("ax", "ay", "az"):
+        s = scale.get(name)
+        if s and s > 0:
+            _accel_scale[name] = float(s)
+
 
 def convert(name, raw):
     """Converts raw sensor values to physical units."""
     if name in ("ax", "ay", "az"):
-        return (raw / ACCEL_LSB_PER_G, "g")
+        return (raw / (ACCEL_LSB_PER_G * _accel_scale[name]), "g")
     elif name == TEMP:
         return (raw / 340.0 + 36.53, "°C")   # MPU6050 datasheet formula
     else:
@@ -92,6 +106,11 @@ def _smoke():
     pkt3 = dict(pkt2, tp=340)                 # +1 degC over the 36.53 offset
     s = ci.update(pkt3, 1.4)
     assert abs(s.converted[TEMP][0] - 37.53) < 1e-9 and s.converted[TEMP][1] == "°C"
+    set_accel_scale({"ax": 1.02, "az": 0, "gy": 2.0})  # az/gy entries ignored
+    assert abs(convert("ax", 16384)[0] - 1 / 1.02) < 1e-9
+    assert abs(convert("az", 16384)[0] - 1.0) < 1e-9
+    assert abs(convert("gx", 131)[0] - 1.0) < 1e-9
+    set_accel_scale({"ax": 1.0})              # restore for any later asserts
     print("CleanInput smoke OK")
 
 

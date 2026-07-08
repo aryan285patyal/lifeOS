@@ -22,3 +22,6 @@ secrets.h
 
 # Runtime state -- the Connect tab's remembered default device (machine-specific)
 connect_config.json
+
+# Per-device 6-position accel calibration (scale factors; bias lives on the ESP32)
+calibration.json

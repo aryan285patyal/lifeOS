@@ -14,9 +14,19 @@
 // Stop video / Wi-Fi off (Bluetooth):  wifi:off  ->  wifi:off,ok
 // Identity query (over Bluetooth):     id?  ->  id:lifeos,proto:1,servos:N
 // IMU recalibration (over Bluetooth):  cal  ->  cal:start ... cal:done
-//   (re-runs accel+gyro bias calibration; keep the sensor still ~2 s; telemetry
-//    pauses while it runs)
+//   (re-runs the GYRO bias calibration; keep the sensor still ~2 s in any
+//    orientation; telemetry pauses while it runs. Accel offsets are never
+//    touched here -- see recalibrateImu() for why the library's accel cal
+//    is broken; use the GUI's 6-position wizard instead)
+// 6-position accel cal (Bluetooth):    acal:set,<bx>,<by>,<bz>  ->  acal:ok,<ox>,<oy>,<oz>
+//   (per-axis accel bias in raw +/-2g counts, solved by the GUI's six-face
+//    wizard; converted to hardware offset-register units, written to the MPU,
+//    and persisted in NVS so they survive power cycles)
+//   acal:clear  ->  acal:cleared  (drop stored offsets; next boot auto-cals)
 // Servo enable/disable (Bluetooth):    e0:1,e1:0  (0 = detach, servo goes limp)
+// Debug echo (USB serial monitor):     debug  ->  toggles echoing every BT
+//   telemetry line to USB Serial (plus a 1 Hz Wi-Fi/video status line and the
+//   stored acal offsets on enable), whether or not a BT client is connected.
 //
 // Concurrency: an IMU task on core 0 drains the DMP FIFO (interrupt on GPIO4);
 // loop() on core 1 runs Bluetooth + the Wi-Fi video sender.
@@ -32,6 +42,7 @@
 #include "BluetoothSerial.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <Preferences.h>
 
 #define INTERRUPT_PIN 4              // MPU6050 INT -> ESP32 GPIO4
 const char*  BT_NAME       = "lifeos";
@@ -51,6 +62,13 @@ bool  servoEnabled[NUM_SERVOS] = {true, true};  // detached (limp) when false; e
 
 MPU6050 mpu;
 BluetoothSerial SerialBT;
+
+// --- 6-position accel calibration: offset-register values persisted in NVS
+// (the chip loses them on power cycle; dmpInitialize() also resets them) ---
+Preferences prefs;
+bool acalStored = false;             // NVS holds valid 6-position offsets
+
+bool debugMode = false;              // "debug" over USB: echo telemetry to Serial
 
 // --- Wi-Fi video state (provisioned over Bluetooth) ---
 WiFiUDP   videoUdp;
@@ -94,8 +112,7 @@ uint32_t      lastSentSeq  = 0;
 // ---------------------------------------------------------------------------
 void imuTask(void *param) {
   Quaternion   q;
-  VectorInt16  accel;
-  int16_t      gyro[3];
+  int16_t      rawA[3], rawG[3];
 
   for (;;) {
     if (!dmpReady || imuPause) {
@@ -124,14 +141,18 @@ void imuTask(void *param) {
       mpu.getFIFOBytes(fifoBuffer, packetSize);
 
       mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetAccel(&accel, fifoBuffer);
-      mpu.dmpGetGyro(gyro, fifoBuffer);
+      // Accel/gyro come from the sensor's data registers, NOT the DMP FIFO:
+      // the FIFO "accel" is a DMP-internal filtered quantity that only equals
+      // gravity when flat and collapses toward zero when rotated (measured
+      // ~0.03g total while inverted) -- useless as raw counts. The registers
+      // hold the true raw measurements at the DMP's FSRs (+/-2g, +/-2000dps).
+      mpu.getMotion6(&rawA[0], &rawA[1], &rawA[2], &rawG[0], &rawG[1], &rawG[2]);
       int16_t temp = mpu.getTemperature();   // not in the FIFO; separate register
 
       portENTER_CRITICAL(&stateMux);
       sQ[0] = q.w; sQ[1] = q.x; sQ[2] = q.y; sQ[3] = q.z;
-      sAccel[0] = accel.x; sAccel[1] = accel.y; sAccel[2] = accel.z;
-      sGyro[0] = gyro[0]; sGyro[1] = gyro[1]; sGyro[2] = gyro[2];
+      sAccel[0] = rawA[0]; sAccel[1] = rawA[1]; sAccel[2] = rawA[2];
+      sGyro[0] = rawG[0]; sGyro[1] = rawG[1]; sGyro[2] = rawG[2];
       sTemp = temp;
       sSeq++;
       portEXIT_CRITICAL(&stateMux);
@@ -183,8 +204,13 @@ void applyServoCommand(char *buf) {
   }
 }
 
-// Re-run the MPU6050 bias calibration on demand (BT line "cal"). Blocks loop()
-// for ~1-2 s, so telemetry pauses; the sensor must be held still meanwhile.
+// Re-run the MPU6050 GYRO bias calibration on demand (BT line "cal"). Blocks
+// loop() for ~1-2 s, so telemetry pauses; the sensor must be held still (any
+// orientation). Accel is deliberately NOT touched: the library's
+// CalibrateAccel() drives flat Z to 2g instead of 1g (measured on v1.4.4),
+// planting a +1g Z bias in the offset registers -- the cause of the DMP
+// roll/pitch decaying toward wrong angles. Accel offsets come only from the
+// GUI's 6-position calibration ("acal:set") or factory trim.
 void recalibrateImu() {
   if (!dmpReady) {
     SerialBT.println("cal:error,dmp-not-ready");
@@ -194,13 +220,67 @@ void recalibrateImu() {
   imuPause = true;
   while (!imuPaused) vTaskDelay(1);    // wait for the IMU task to free the bus
   mpu.setDMPEnabled(false);
-  mpu.CalibrateAccel(6);
   mpu.CalibrateGyro(6);
   mpu.resetFIFO();
   mpu.setDMPEnabled(true);
   imuPause = false;
   SerialBT.println("cal:done");
-  Serial.println("IMU biases recalibrated (BT request)");
+  Serial.println("Gyro biases recalibrated (BT request)");
+}
+
+// Apply + persist 6-position accel offsets (BT line "acal:set,<bx>,<by>,<bz>",
+// bias in raw +/-2g counts from the GUI wizard) or drop them ("acal:clear").
+// Offset registers count 2048 LSB/g vs 16384 LSB/g raw -> divide by 8; bit 0
+// of each register is a reserved factory temperature-compensation bit and must
+// be preserved.
+void setAccelCal(char *args) {
+  if (strcmp(args, "clear") == 0) {
+    prefs.begin("lifeos", false);
+    prefs.remove("aov"); prefs.remove("aox"); prefs.remove("aoy"); prefs.remove("aoz");
+    prefs.end();
+    acalStored = false;
+    SerialBT.println("acal:cleared");
+    Serial.println("6-position accel offsets cleared (BT request)");
+    return;
+  }
+  long b[3];
+  if (sscanf(args, "set,%ld,%ld,%ld", &b[0], &b[1], &b[2]) != 3) {
+    SerialBT.println("acal:error,bad-args");
+    return;
+  }
+  if (abs(b[0]) > 8000 || abs(b[1]) > 8000 || abs(b[2]) > 8000) {
+    SerialBT.println("acal:error,bias-too-large");
+    return;
+  }
+  if (!dmpReady) {
+    SerialBT.println("acal:error,dmp-not-ready");
+    return;
+  }
+  imuPause = true;
+  while (!imuPaused) vTaskDelay(1);
+  mpu.setDMPEnabled(false);
+  int16_t cur[3] = { mpu.getXAccelOffset(), mpu.getYAccelOffset(), mpu.getZAccelOffset() };
+  int16_t reg[3];
+  for (int i = 0; i < 3; i++) {
+    int16_t nv = cur[i] - (int16_t)lroundf(b[i] / 8.0f);
+    reg[i] = (nv & ~1) | (cur[i] & 1);   // keep the factory temp-comp bit
+  }
+  mpu.setXAccelOffset(reg[0]);
+  mpu.setYAccelOffset(reg[1]);
+  mpu.setZAccelOffset(reg[2]);
+  mpu.resetFIFO();
+  mpu.setDMPEnabled(true);
+  imuPause = false;
+  prefs.begin("lifeos", false);
+  prefs.putShort("aox", reg[0]);
+  prefs.putShort("aoy", reg[1]);
+  prefs.putShort("aoz", reg[2]);
+  prefs.putBool("aov", true);
+  prefs.end();
+  acalStored = true;
+  SerialBT.printf("acal:ok,%d,%d,%d\n", reg[0], reg[1], reg[2]);
+  Serial.printf("6-position accel offsets set: %d %d %d (persisted)\n",
+                reg[0], reg[1], reg[2]);
 }
 
 // Active Wi-Fi shutdown (BT line "wifi:off"): stop video and turn the radio off
@@ -241,6 +321,8 @@ void handleBtLine(char *line) {
     SerialBT.printf("id:lifeos,proto:1,servos:%d\n", NUM_SERVOS);
   } else if (strcmp(line, "cal") == 0) {
     recalibrateImu();
+  } else if (strncmp(line, "acal:", 5) == 0) {
+    setAccelCal(line + 5);
   } else if (strcmp(line, "wifi:off") == 0) {   // before the wifi: prefix match
     stopWifiVideo();
   } else if (strncmp(line, "wifi:", 5) == 0) {
@@ -266,10 +348,75 @@ void btPoll() {
 
 void btSendSensor(const float q[4], const int16_t a[3], const int16_t g[3],
                   int16_t t) {
-  if (!SerialBT.hasClient()) return;
+  if (!SerialBT.hasClient() && !debugMode) return;
   char buffer[200];
   buildTelemetry(buffer, sizeof(buffer), q, a, g, t);
-  SerialBT.println(buffer);
+  if (SerialBT.hasClient()) SerialBT.println(buffer);
+  if (debugMode) Serial.println(buffer);   // exact line the PC would receive
+}
+
+// --- USB-serial debug console: "debug" toggles echoing everything the ESP32
+// sends (BT telemetry verbatim + 1 Hz Wi-Fi/video status) to the monitor. ---
+// Dump sensor config + a raw sample to USB Serial. Callers must own the I2C
+// bus (boot before the IMU task starts, or inside an imuPause window).
+void printSensorState(const char *tag) {
+  int16_t a[3], g[3];
+  mpu.getMotion6(&a[0], &a[1], &a[2], &g[0], &g[1], &g[2]);
+  Serial.printf("dbg %s: fsr accel=%d gyro=%d | accel offs %d %d %d | "
+                "gyro offs %d %d %d | raw a %d %d %d g %d %d %d\n",
+                tag, mpu.getFullScaleAccelRange(), mpu.getFullScaleGyroRange(),
+                mpu.getXAccelOffset(), mpu.getYAccelOffset(), mpu.getZAccelOffset(),
+                mpu.getXGyroOffset(), mpu.getYGyroOffset(), mpu.getZGyroOffset(),
+                a[0], a[1], a[2], g[0], g[1], g[2]);
+}
+
+void setDebugMode(bool on) {
+  debugMode = on;
+  Serial.printf("dbg: telemetry echo %s\n", on ? "ON" : "OFF");
+  if (!on) return;
+  prefs.begin("lifeos", false);
+  Serial.printf("dbg: acal stored=%d ox=%d oy=%d oz=%d | bt client=%d\n",
+                prefs.getBool("aov", false) ? 1 : 0,
+                prefs.getShort("aox", 0), prefs.getShort("aoy", 0),
+                prefs.getShort("aoz", 0), SerialBT.hasClient() ? 1 : 0);
+  prefs.end();
+  if (dmpReady) {                      // grab the bus safely for the dump
+    imuPause = true;
+    while (!imuPaused) vTaskDelay(1);
+    printSensorState("now");
+    imuPause = false;
+  }
+}
+
+void debugVideoTick() {
+  static unsigned long lastPrint = 0;
+  static uint32_t lastSeq = 0;
+  unsigned long now = millis();
+  if (now - lastPrint < 1000) return;
+  const char *st = (videoState == VID_STREAMING)  ? "streaming" :
+                   (videoState == VID_CONNECTING) ? "connecting" : "idle";
+  Serial.printf("dbg wifi: state=%s pkts/s=%u -> %s:%d\n",
+                st, videoSeq - lastSeq, laptopIp.toString().c_str(), VIDEO_PORT);
+  lastPrint = now;
+  lastSeq = videoSeq;
+}
+
+void usbPoll() {
+  static char line[64];
+  static size_t idx = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (idx > 0) {
+        line[idx] = '\0';
+        idx = 0;
+        if (strcmp(line, "debug") == 0) setDebugMode(!debugMode);
+        else Serial.printf("dbg: unknown command '%s' (only: debug)\n", line);
+      }
+    } else if (idx < sizeof(line) - 1) {
+      line[idx++] = c;
+    }
+  }
 }
 
 
@@ -330,9 +477,24 @@ void setup() {
 
   devStatus = mpu.dmpInitialize();
   if (devStatus == 0) {
-    mpu.CalibrateAccel(6);
+    // dmpInitialize() reset the chip, so offsets must be re-applied every boot.
+    // Accel: stored 6-position offsets from NVS, else factory trim. NEVER the
+    // library's CalibrateAccel() -- it drives flat Z to 2g instead of 1g
+    // (measured on v1.4.4), the +1g Z bias that made DMP roll/pitch decay
+    // toward wrong angles. Gyro bias cal is correct and orientation-agnostic
+    // (needs stillness only), so it always runs.
+    prefs.begin("lifeos", false);
+    acalStored = prefs.getBool("aov", false);
+    if (acalStored) {
+      mpu.setXAccelOffset(prefs.getShort("aox", 0));
+      mpu.setYAccelOffset(prefs.getShort("aoy", 0));
+      mpu.setZAccelOffset(prefs.getShort("aoz", 0));
+      Serial.println("Applied stored 6-position accel offsets from NVS");
+    }
+    prefs.end();
     mpu.CalibrateGyro(6);
     mpu.setDMPEnabled(true);
+    printSensorState("boot");
     attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
     packetSize = mpu.dmpGetFIFOPacketSize();
     dmpReady = true;
@@ -350,7 +512,9 @@ void setup() {
 
 void loop() {
   btPoll();              // sensor commands + Wi-Fi provisioning
+  usbPoll();             // USB serial monitor: "debug" toggle
   updateWifiVideo();     // Wi-Fi connect state machine + video frames
+  if (debugMode) debugVideoTick();
 
   unsigned long currentTime = millis();
   if (currentTime - previousTime < interval) return;
