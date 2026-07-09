@@ -314,7 +314,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Signal strength tells radio problems apart from network problems
   for the wireless feed, and gives the measurement needed for the pending
   IPEX-vs-PCB antenna check (to-do).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (0ddd169)
 
 ## 2026-07-08 — Antenna check done: PCB antenna active; rework deferred
 - **What:** Using the new RSSI readout, the touch/detune test confirmed the
@@ -325,4 +325,4 @@ designDecisions.md, and to-do.md.
   verification recipe.
 - **Why:** Resolves the open antenna question with a measurement; the rework
   only matters for range/enclosure use, so it is production backlog.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (0ddd169)
