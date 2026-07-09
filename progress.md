@@ -178,7 +178,7 @@ designDecisions.md, and to-do.md.
   stubbing, but its silicon drops Bluetooth Classic and its camera/SD/USB pins
   leave only six free GPIOs — so the link, the pins, and the connect flow all
   had to change together (designDecisions §16).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Board-aware link naming: no more "Bluetooth COMx" on the S3's USB
 - **What:** `BluetoothLink` (gui.py) now takes a `label` ("Bluetooth" /
@@ -191,7 +191,7 @@ designDecisions.md, and to-do.md.
 - **Why:** The S3's CH343 USB COM port rides the same pyserial link class as
   the WROOM-32's paired-BT COM port, and the hardcoded "Bluetooth" wording
   misnamed the transport whenever the S3 board was selected (user-reported).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — "Find lifeOs port": scanning arrow on the port being probed
 - **What:** While the prober walks the COM ports, the list row currently being
@@ -203,7 +203,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Probing opens each port for up to ~1.5 s; the only feedback was the
   button saying "Probing...", so the user couldn't tell which port was under
   scan or how far along the sweep was.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Serial-monitor panel: persistent checkbox + terminal on all tabs
 - **What:** New "Serial monitor" checkbox on the Connect tab (persisted in
@@ -217,7 +217,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Go wireless reports success but telemetry dies after unplugging
   USB; there was no way to watch the ESP32's replies or poke it with raw
   commands from the GUI. designDecisions.md §17.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Serial monitor pinned to 1/5 of the window height
 - **What:** The panel's height is now set to `window height // 5` in a
@@ -226,7 +226,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Layout stretch factors only split leftover space after size hints,
   so the "bottom quarter" drifted with tab content; the user wants an exact,
   window-proportional 1/5. designDecisions.md §17 updated.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Serial monitor: "Hide telemetry" defaults on and persists
 - **What:** The panel's Hide-telemetry checkbox now starts checked and its
@@ -236,7 +236,7 @@ designDecisions.md, and to-do.md.
 - **Why:** The panel exists mainly to read control replies; the 50 Hz
   telemetry firehose should be opt-in, and the choice should survive GUI
   restarts. designDecisions.md §17 updated.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Serial monitor: [PC]/[ESP] origin tags + button-press logging
 - **What:** Terminal lines are now tagged by origin - `[ESP]` for lines
@@ -249,7 +249,7 @@ designDecisions.md, and to-do.md.
 - **Why:** While debugging the wireless-feed dropout, the terminal should
   read as a single timeline of what the user did and what the board answered,
   with the actor of each line unambiguous.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Serial monitor: transport tags ([USB] / [BT] / [WiFi])
 - **What:** Link traffic in the terminal now carries a second tag naming the
@@ -259,7 +259,7 @@ designDecisions.md, and to-do.md.
 - **Why:** The wireless-feed debugging hinges on which pipe a line traveled -
   after Go wireless the tag flipping from [USB] to [WiFi] (or not) is the
   evidence.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Wireless-feed dropout diagnosed: Windows Firewall; hint in GUI
 - **What:** Root-caused "Go wireless reports success, then no data after USB
@@ -273,7 +273,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Any user hitting "wifi:connected but no feed" should find the
   one-time admin-terminal fix right where they're looking; the agent cannot
   add firewall rules itself (permission/elevation).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — Wireless dropout, layer 2: campus network drops inter-VLAN UDP
 - **What:** With the lifeOs firewall rules confirmed active (Get-NetFirewallRule),
@@ -287,7 +287,7 @@ designDecisions.md, and to-do.md.
   closes the port mid-read during Go wireless.
 - **Why:** Root-causes "wifi:connected but no feed" beyond the firewall layer;
   the traceback the user hit at every link swap was noise masking real errors.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
 
 ## 2026-07-08 — fixes.md production backlog + defer-or-fix triage rule
 - **What:** New `fixes.md` at the repo root: diagnosed-but-deferred issues,
@@ -301,4 +301,4 @@ designDecisions.md, and to-do.md.
   go-wireless item closed as deferred.
 - **Why:** Keep sessions pointed at the main goal instead of bug fights,
   without losing the diagnosis work for a future production-hardening pass.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (3c0cf38)
