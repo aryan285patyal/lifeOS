@@ -68,3 +68,33 @@ whole time (`wifi:connected,<ip>`, "streaming video to <laptop_ip>").
 - **ESP-NOW dongle** (to-do.md / designDecisions §16): the retired WROOM-32
   as a USB radio bridge — bypasses infrastructure networks entirely; the
   robust answer for hostile networks.
+
+---
+
+## 2. S3-CAM RF path: switch from PCB antenna to the external IPEX antenna
+
+*Logged 2026-07-08. Decision: solder rework later. Works for now on the
+onboard PCB antenna.*
+
+**Finding (2026-07-08):** With the new RSSI readout (`rs` telemetry field),
+the touch/detune test on the module's PCB antenna trace moved RSSI, i.e. the
+radio is using the **onboard PCB antenna** — the ESP32-S3-WROOM-1's RF-path
+selector (0 Ohm resistor at the module's antenna corner) is still routed to
+the PCB trace even though the IPEX socket is populated. The plugged-in
+external antenna is currently doing nothing. (This resolves the old
+"Check the S3-CAM's RF-path selector" to-do item.)
+
+**Deferred fix:** rotate the 0 Ohm resistor (or bridge the correct pads with
+a solder blob) at the module's antenna-corner pad triangle: center pad ->
+u.FL/IPEX side instead of center pad -> zig-zag trace side. Fine-pitch
+work - needs a fine tip / hot tweezers and a steady hand.
+
+**Verification after the rework:** RSSI readout in the same spot should gain
+roughly +3..10 dB with the external antenna attached; unplugging the external
+antenna should now crash RSSI (10-20+ dB); touching the PCB trace should do
+nothing. Don't leave it transmitting long with the IPEX path selected and no
+antenna attached (PA stress).
+
+**Why deferred:** the PCB antenna is adequate at current desk range; the
+rework only matters for range/enclosure use (production concern, ties into
+fixes.md section 1's wireless reliability).

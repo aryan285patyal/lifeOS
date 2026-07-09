@@ -48,7 +48,7 @@ Files:
 **Sensor telemetry (Bluetooth), one newline-delimited line per sample (~50 Hz):**
 
 ```
-q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:<i>,s1:<i>,e0:<i>,e1:<i>,dmp:<i>,wf:<i>
+q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:<i>,s1:<i>,e0:<i>,e1:<i>,dmp:<i>,wf:<i>,rs:<i>
 ```
 
 - `q0..q3` — fused DMP quaternion (w, x, y, z), floats.
@@ -62,6 +62,9 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:
 - `e0..e1` — 1 if that servo is enabled (attached); 0 = detached/limp.
 - `dmp` — 1 if the DMP is producing orientation (drives the MPU status dot).
 - `wf` — 1 if Wi-Fi video is streaming (drives the Wi-Fi status dot).
+- `rs` — Wi-Fi RSSI in dBm, sampled at 1 Hz on the ESP32 (0 = radio off /
+  not connected). Optional like `tp`; drives the color-coded RSSI readout in
+  the status bar (green ≥ −60, amber to −70, red below).
 
 `q*` parse as float, everything else int. Non-telemetry replies (`cal:*`,
 `acal:*`, `wifi:*`, `id:*`) arrive on the same stream; `Link._ingest` stashes

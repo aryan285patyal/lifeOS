@@ -117,6 +117,7 @@ Preferences prefs;
 bool acalStored = false;             // NVS holds valid 6-position offsets
 
 bool debugMode = false;              // "debug" over USB: echo telemetry to Serial
+int  wifiRssi  = 0;                  // WiFi.RSSI() dBm, sampled 1 Hz; 0 = radio off
 
 // --- Wi-Fi video state (provisioned over Bluetooth) ---
 WiFiUDP   videoUdp;
@@ -242,13 +243,14 @@ void buildTelemetry(char *buffer, size_t n, const float q[4],
   // dmp = MPU DMP producing orientation; wf = Wi-Fi video streaming. These let
   // the GUI status bar light the MPU and Wi-Fi indicators truthfully.
   // tp = die temperature, raw counts (degC = raw/340 + 36.53, done on the PC).
+  // rs = Wi-Fi RSSI in dBm (1 Hz sample; 0 = radio off / not connected).
   snprintf(buffer, n,
            "q0:%.4f,q1:%.4f,q2:%.4f,q3:%.4f,ax:%d,ay:%d,az:%d,gx:%d,gy:%d,gz:%d,"
-           "tp:%d,s0:%d,s1:%d,e0:%d,e1:%d,dmp:%d,wf:%d",
+           "tp:%d,s0:%d,s1:%d,e0:%d,e1:%d,dmp:%d,wf:%d,rs:%d",
            q[0], q[1], q[2], q[3], a[0], a[1], a[2], g[0], g[1], g[2],
            t, servoPos[0], servoPos[1],
            servoEnabled[0] ? 1 : 0, servoEnabled[1] ? 1 : 0,
-           dmpReady ? 1 : 0, (videoState == VID_STREAMING) ? 1 : 0);
+           dmpReady ? 1 : 0, (videoState == VID_STREAMING) ? 1 : 0, wifiRssi);
 }
 
 void setServoEnabled(int idx, bool en) {
@@ -542,8 +544,9 @@ void debugVideoTick() {
   if (now - lastPrint < 1000) return;
   const char *st = (videoState == VID_STREAMING)  ? "streaming" :
                    (videoState == VID_CONNECTING) ? "connecting" : "idle";
-  Serial.printf("dbg wifi: state=%s pkts/s=%u -> %s:%d\n",
-                st, videoSeq - lastSeq, laptopIp.toString().c_str(), VIDEO_PORT);
+  Serial.printf("dbg wifi: state=%s pkts/s=%u rssi=%d -> %s:%d\n",
+                st, videoSeq - lastSeq, wifiRssi,
+                laptopIp.toString().c_str(), VIDEO_PORT);
   lastPrint = now;
   lastSeq = videoSeq;
 }
@@ -679,6 +682,15 @@ void loop() {
   if (debugMode) debugVideoTick();
 
   unsigned long currentTime = millis();
+
+  // 1 Hz Wi-Fi signal sample for the rs telemetry field (kept off the 50 Hz
+  // hot path; WiFi.RSSI() is only meaningful while the station is connected).
+  static unsigned long lastRssiTime = 0;
+  if (currentTime - lastRssiTime >= 1000) {
+    lastRssiTime = currentTime;
+    wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  }
+
   if (currentTime - previousTime < interval) return;
   previousTime = currentTime;
 

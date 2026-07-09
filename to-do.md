@@ -77,9 +77,11 @@ check them off (and date them) when done.
 - [ ] **ESP-NOW dongle fallback** — repurpose the retired WROOM-32 as a USB
   dongle bridging ESP-NOW radio ↔ COM port for router-free wireless telemetry
   (no video). designDecisions §16.
-- [ ] **Check the S3-CAM's RF-path selector** — if the external IPEX antenna
-  makes no measurable difference, the 0 Ω resistor near the socket is still
-  routed to the PCB antenna.
+- [x] **Check the S3-CAM's RF-path selector** *(done 2026-07-08)* — confirmed
+  with the RSSI readout + antenna touch test: the radio uses the **onboard
+  PCB antenna**; the 0 Ω resistor is still routed away from the IPEX socket,
+  so the plugged-in external antenna does nothing. The solder rework to
+  switch paths is deferred to fixes.md §2.
 - [x] **progress.md changelog + doc-upkeep rules** *(done 2026-07-07)* —
   progress.md logs every change (what / why / timestamp / pushed-to-GitHub
   flag), back-filled from git history and the docs; CLAUDE.md now requires

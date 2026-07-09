@@ -1996,6 +1996,12 @@ class MonitorWindow(QMainWindow):
                              ("S1", self.dot_s1), ("S2", self.dot_s2), ("MPU", self.dot_mpu)]:
             bar.addWidget(QLabel(caption))
             bar.addWidget(dot)
+        self.rssi_label = QLabel("--")
+        self.rssi_label.setToolTip(
+            "Wi-Fi signal at the ESP32 (RSSI): -50 dBm excellent, -67 good, "
+            "below -75 weak. -- = radio off / no rs field in telemetry.")
+        bar.addWidget(QLabel("RSSI"))
+        bar.addWidget(self.rssi_label)
 
     def _update_status_dots(self, values, connected):
         # Everything is reported over the one telemetry stream (BT, USB serial,
@@ -2009,6 +2015,16 @@ class MonitorWindow(QMainWindow):
         self.dot_s2.set_live(connected and "s1" in values and int(values.get("e1", 1)) == 1)
         # dmp defaults to 1 for older firmware that doesn't send the field
         self.dot_mpu.set_live(connected and "q0" in values and int(values.get("dmp", 1)) == 1)
+        # Wi-Fi RSSI readout (rs, dBm at 1 Hz; optional field - 0/absent = off)
+        rssi = int(values.get("rs", 0) or 0) if connected else 0
+        if rssi:
+            color = ("#2e7d32" if rssi >= -60 else
+                     "#f9a825" if rssi >= -70 else "#c62828")
+            self.rssi_label.setText(f"{rssi} dBm")
+            self.rssi_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        else:
+            self.rssi_label.setText("--")
+            self.rssi_label.setStyleSheet("")
 
     def _current_flips(self):
         return {key: box.isChecked() for key, box in self.flip_boxes.items()}

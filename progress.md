@@ -302,3 +302,27 @@ designDecisions.md, and to-do.md.
 - **Why:** Keep sessions pointed at the main goal instead of bug fights,
   without losing the diagnosis work for a future production-hardening pass.
 - **Pushed:** yes (3c0cf38)
+
+## 2026-07-08 — Wi-Fi RSSI in telemetry + status-bar readout
+- **What:** Firmware samples `WiFi.RSSI()` at 1 Hz (off the 50 Hz hot path)
+  and appends `rs:<dBm>` to the telemetry line (0 = radio off); the `debug`
+  1 Hz status prints it too. GUI status bar gains an RSSI readout next to the
+  dots, color-coded green (>= -60 dBm), amber (to -70), red (below), "--"
+  when absent - old firmware without the field just shows "--" (optional
+  field, same pattern as `tp`). Both firmware variants compile-verified
+  (S3 73% flash, WROOM-32 huge_app 53%). CLAUDE.md/README protocol updated.
+- **Why:** Signal strength tells radio problems apart from network problems
+  for the wireless feed, and gives the measurement needed for the pending
+  IPEX-vs-PCB antenna check (to-do).
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Antenna check done: PCB antenna active; rework deferred
+- **What:** Using the new RSSI readout, the touch/detune test confirmed the
+  S3-CAM radio is on the onboard PCB antenna (the module's 0 Ohm RF-path
+  resistor is not routed to the IPEX socket - the external antenna is
+  currently inert). Checked off the RF-path to-do item; the solder rework to
+  switch to the external antenna is logged as fixes.md section 2 with the
+  verification recipe.
+- **Why:** Resolves the open antenna question with a measurement; the rework
+  only matters for range/enclosure use, so it is production backlog.
+- **Pushed:** no (uncommitted)

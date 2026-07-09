@@ -34,7 +34,7 @@ Identical bytes on every transport (BT SPP / USB serial / Wi-Fi UDP).
 **Sensor telemetry, one line per sample (~50 Hz):**
 
 ```
-q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:<i>,s1:<i>,e0:<i>,e1:<i>,dmp:<i>,wf:<i>
+q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:<i>,s1:<i>,e0:<i>,e1:<i>,dmp:<i>,wf:<i>,rs:<i>
 ```
 
 - `q0..q3` — fused DMP quaternion (w, x, y, z).
@@ -43,6 +43,8 @@ q0:<f>,q1:<f>,q2:<f>,q3:<f>,ax:<i>,ay:<i>,az:<i>,gx:<i>,gy:<i>,gz:<i>,tp:<i>,s0:
   servo is enabled (0 = detached/limp).
 - `dmp` — DMP producing orientation (1/0); `wf` — Wi-Fi video streaming (1/0).
   These drive the MPU and Wi-Fi status indicators.
+- `rs` — Wi-Fi RSSI in dBm, sampled at 1 Hz on the ESP32 (0 = radio off).
+  Shown color-coded in the GUI status bar.
 
 **Control PC→ESP32:** `s0:90,s1:45` (servo), `e0:0` (disable/limp a servo),
 `id?` → `id:lifeos,proto:1,servos:2,board:<b>` (identity, for COM auto-detect),
