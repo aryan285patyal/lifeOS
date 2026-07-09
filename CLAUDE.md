@@ -6,18 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `lifeOs` is a two-part hardware project: an ESP32 firmware that reads an MPU6050
 IMU and drives servos, and a PySide6 desktop GUI that visualizes orientation,
-plots the data, commands the servos, and manages connectivity. The ESP32 runs
-**two channels at once**:
+plots the data, commands the servos, and manages connectivity. **Two boards are
+supported** — a compile-time `#define` at the top of `lifeOs.ino`
+(`BOARD_S3CAM` / `BOARD_WROOM32`) plus a runtime Board dropdown in the GUI:
 
-- **Bluetooth Classic SPP (always on)** — sensor telemetry out (quaternion + raw
-  counts + servo echo + health flags), servo commands in, an `id?` identity
-  reply, and Wi-Fi **provisioning** in. Network-independent; keeps the laptop's
-  Wi-Fi free. This is the link the Monitor/Servos tabs read from.
-- **Wi-Fi station (on demand)** — high-bandwidth **video** over UDP. Brought up
-  only after the laptop sends Wi-Fi credentials + its own current IP over
-  Bluetooth, so a changing laptop DHCP address is handled every session and
-  nothing is hardcoded. (Camera is future work; a synthetic frame stream tests
-  the path today.)
+- **ESP-WROOM-32** — the sensor/servo **feed** is Bluetooth Classic SPP
+  (always on). Network-independent; keeps the laptop's Wi-Fi free.
+- **ESP32-S3-CAM** (GoouuuTech, ESP32-S3-WROOM-1 N16R8, OV3660 camera, dual
+  USB-C, microSD, WS2812 on 48) — the S3 silicon has **no Bluetooth Classic**,
+  so the feed starts on **USB serial** (the CH343 "COM" USB-C port, same
+  newline protocol) and moves onto **Wi-Fi UDP** via `feed:wifi` (GUI "Go
+  wireless": telemetry → laptop:5005, commands in on 5006 — the revived
+  `WifiLink` path), letting the board run untethered.
+
+On either board, **Wi-Fi station (on demand)** carries high-bandwidth **video**
+over UDP: brought up only after the laptop sends Wi-Fi credentials + its own
+current IP over the feed link, so a changing laptop DHCP address is handled
+every session and nothing is hardcoded. (Real camera is future work — the
+S3-CAM's OV3660 is the intended source; a synthetic frame stream tests the
+path today.)
 
 Files:
 - `lifeOs.ino` — firmware (MPU6050 DMP + servos + BT sensor link + Wi-Fi video).
@@ -33,6 +40,8 @@ Files:
 - `progress.md` — changelog: every change with description, reason, timestamp,
   and a pushed-to-GitHub flag.
 - `to-do.md` — living task list.
+- `fixes.md` — production backlog: diagnosed-but-deferred issues, with the
+  debugging already done and candidate fixes.
 
 ## Wire protocol
 
@@ -78,27 +87,46 @@ them per prefix for `Link.control()`.
   `acal:error,...`.
 - `acal:clear` — drop the stored offsets (reply `acal:cleared`); next boot
   reverts to the automatic flat calibration.
-- `id?` → ESP32 replies `id:lifeos,proto:1,servos:2` (used to auto-detect the
-  lifeOs COM port).
+- `id?` → ESP32 replies `id:lifeos,proto:1,servos:2,board:<s3cam|wroom32>`
+  (used to auto-detect the lifeOs COM port).
 - `wifi:<ssid>|<password>|<laptop_ip>` — provision Wi-Fi; the ESP32 joins that
   network and streams video UDP to `<laptop_ip>:5010`. Replies `wifi:connecting`
-  then `wifi:connected,<esp_ip>` over Bluetooth.
+  then `wifi:connected,<esp_ip>` over the feed link.
 - `wifi:off` — active video/Wi-Fi teardown: stops the stream and turns the
-  radio off until re-provisioned. Replies `wifi:off,ok`.
+  radio off until re-provisioned. Replies `wifi:off,ok`. On the S3 this also
+  drops a Wi-Fi feed back to USB.
+- `feed:wifi` / `feed:usb` — **S3 only**: move the sensor/servo feed onto Wi-Fi
+  UDP (requires provisioned Wi-Fi; replies `feed:wifi,ok` or
+  `feed:error,no-wifi`) or back to USB serial (`feed:usb,ok`). While the feed
+  is Wi-Fi, telemetry goes to `<laptop_ip>:5005` (`UDP_PORT`) and a command
+  socket on 5006 (`CMD_PORT`) accepts `hello` (re-learn the laptop IP — sent by
+  `WifiLink.register_peer`) plus all the control lines above. The WROOM-32
+  replies `feed:error,unsupported`.
+- `debug` — toggle telemetry echo + 1 Hz status on the USB serial monitor
+  (handled as a normal control line; on the WROOM-32 also accepted directly on
+  the USB monitor).
 
 **Video (Wi-Fi UDP → port 5010):** synthetic `vid:<seq>:`-prefixed 1 KB packets.
 
 ## GUI
 
-- **Connect tab** — two sections (no transport dropdown):
-  - *Bluetooth (sensor & servos)*: COM port list, **Find lifeOs port**
-    (auto-detects by sending `id?`/reading telemetry), Connect, Disconnect
-    (closes the COM port, which actively tears the SPP link down), Save as
-    default.
-  - *Wi-Fi (video)*: SSID / password / laptop-IP fields (IP auto-filled),
-    Connect (sends creds over the active BT link), Disconnect (sends
-    `wifi:off`), Save as default.
-  - Saved defaults auto-connect BT and auto-provision video on launch.
+- **Connect tab** — a **Board dropdown** at the top (`ESP-WROOM-32 (Bluetooth)`
+  / `ESP32-S3-CAM (USB + Wi-Fi)`, persisted immediately in
+  `connect_config.json` under `board`) retitles the two sections for the
+  selected flow:
+  - *Bluetooth / USB (sensor & servos)*: COM port list, **Find lifeOs port**
+    (auto-detects by sending `id?`/reading telemetry — works identically for a
+    paired-BT COM port and the S3's CH343 USB COM port), Connect, Disconnect,
+    Save as default. On the S3, Connect also sends `feed:usb` to reclaim the
+    feed if it was wireless.
+  - *Wi-Fi (video; on the S3 also the wireless feed)*: SSID / password /
+    laptop-IP fields (IP auto-filled), Connect (sends creds over the active
+    serial link), Disconnect (sends `wifi:off`), **Go wireless** (S3 only:
+    sends `feed:wifi`, then swaps the active link for a `WifiLink` aimed at
+    the ESP32's IP from the `wifi:connected` reply — USB can then be
+    unplugged), Save as default.
+  - Saved defaults auto-connect the serial link and auto-provision video on
+    launch.
 - **Monitor / Servos** — read through a `ConnectionManager` and are
   transport-agnostic.
   - Monitor's table rows are interleaved per axis — ax, gx, ay, gy, az, gz,
@@ -148,24 +176,31 @@ them per prefix for `Link.control()`.
 
 ## Code structure (gui.py)
 
-`Link` (base) → `BluetoothLink` (pyserial COM) and `WifiLink` (legacy UDP sensor,
-retained but not used by the two-section Connect tab). `ConnectionManager` holds
-the active link and proxies `snapshot()/is_connected()/send_servos()/
-description()`; switching links stops the old one. `PortProber` runs COM probing
-off the GUI thread. `DeviceDiscovery` (mDNS) is retained but unused now that
-Wi-Fi is video-only and provisioned over Bluetooth.
+`Link` (base) → `BluetoothLink` (pyserial COM — used for both the WROOM-32's
+paired-BT COM port and the S3's USB COM port) and `WifiLink` (UDP telemetry in
+on 5005, control lines out to 5006 — the S3's wireless feed after Go wireless).
+`ConnectionManager` holds the active link and proxies `snapshot()/
+is_connected()/send_servos()/send_line()/description()`; switching links stops
+the old one. `PortProber` runs COM probing off the GUI thread. `DeviceDiscovery`
+(mDNS) is retained but unused (the ESP32's IP now comes from the
+`wifi:connected` reply).
 
-## GPIO / wiring (ESP-WROOM-32)
+## GPIO / wiring (per board, set by the `BOARD_*` #define)
 
-| Wire | ESP32 pin |
-| --- | --- |
-| MPU6050 SDA | GPIO21 |
-| MPU6050 SCL | GPIO22 |
-| MPU6050 INT | GPIO4 (`INTERRUPT_PIN`) |
-| MPU6050 VCC / GND | 3V3 / GND |
-| MPU6050 AD0 | GND (address `0x68`) |
-| Servo 0 signal | GPIO13 (`SERVO_PINS[0]`) |
-| Servo 1 signal | GPIO25 (`SERVO_PINS[1]`) |
+| Wire | ESP-WROOM-32 | ESP32-S3-CAM |
+| --- | --- | --- |
+| MPU6050 SDA (`PIN_SDA`) | GPIO21 | GPIO21 |
+| MPU6050 SCL (`PIN_SCL`) | GPIO22 | GPIO14 |
+| MPU6050 INT (`INTERRUPT_PIN`) | GPIO4 | GPIO47 |
+| MPU6050 VCC / GND | 3V3 / GND | 3V3 / GND |
+| MPU6050 AD0 | GND (address `0x68`) | GND (address `0x68`) |
+| Servo 0 signal (`SERVO_PINS[0]`) | GPIO13 | GPIO1 |
+| Servo 1 signal (`SERVO_PINS[1]`) | GPIO25 | GPIO2 |
+
+The S3-CAM's only free GPIOs are 1, 2, 3, 14, 21, 47 (camera 4–13/15–18, SD
+38–40, WS2812 LED 48, native USB 19/20, strapping 0/45/46); GPIO3 is the spare.
+`Wire.begin(PIN_SDA, PIN_SCL)` is explicit — the S3's Arduino I2C defaults
+(SDA 8 / SCL 9) are camera data pins.
 
 Power servos from an **external 5–6V supply** (not the ESP32), ground tied to the
 ESP32 ground; add a 470–1000 µF bulk cap across the servo rail. If the MPU reads
@@ -174,8 +209,9 @@ SDA/SCL/VCC/GND, confirm AD0→GND).
 
 ## Critical configuration
 
-- Ports: `VIDEO_PORT` 5010 (Wi-Fi video). `UDP_PORT` 5005 / `CMD_PORT` 5006 remain
-  for the legacy Wi-Fi sensor path only. Constants must match between `lifeOs.ino`
+- Ports: `VIDEO_PORT` 5010 (Wi-Fi video); `UDP_PORT` 5005 / `CMD_PORT` 5006
+  carry the S3's wireless sensor/servo feed (`feed:wifi` mode; same ports the
+  legacy Wi-Fi sensor path used). Constants must match between `lifeOs.ino`
   and `gui.py`.
 - `NUM_SERVOS` / `SERVO_PINS` (firmware) must match `NUM_SERVOS` / `SERVO_GPIOS`
   (gui.py).
@@ -184,12 +220,18 @@ SDA/SCL/VCC/GND, confirm AD0→GND).
 
 ## Build / run
 
-**Firmware:** Arduino IDE / arduino-cli with the ESP32 board package. Libraries:
-"MPU6050" by Electronic Cats + "ESP32Servo" (WiFi/WiFiUdp/BluetoothSerial ship
-with the core). **Set Tools → Partition Scheme → "Huge APP"** — Bluetooth **and**
-Wi-Fi **and** the DMP blob overflow the default partition. Serial at 115200; keep
-the sensor still ~2 s on boot (DMP calibration). Note BT+Wi-Fi coexistence shares
-one radio, so Wi-Fi throughput is lower than Wi-Fi alone.
+**Firmware:** pick the board at the top of `lifeOs.ino` (`#define BOARD_S3CAM`
+or `BOARD_WROOM32`), then Arduino IDE / arduino-cli with the ESP32 board
+package. Libraries: "MPU6050" by Electronic Cats + "ESP32Servo" (WiFi/WiFiUdp/
+BluetoothSerial ship with the core). Board settings:
+- **WROOM-32:** board "ESP32 Dev Module" (`esp32:esp32:esp32`), **Partition
+  Scheme → "Huge APP"** — Bluetooth + Wi-Fi + the DMP blob overflow the
+  default. BT+Wi-Fi coexistence shares one radio, so Wi-Fi throughput drops.
+- **S3-CAM:** board "ESP32S3 Dev Module"
+  (`esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi`); the default 16 MB partition
+  fits (no BT Classic stack). Flash/monitor via the **COM** USB-C port
+  (CH343).
+Serial at 115200; keep the sensor still ~2 s on boot (DMP calibration).
 
 **PC:**
 ```
@@ -197,10 +239,11 @@ python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt   # PySide6 6.8.0.2, zeroconf, pyserial
 python gui.py
 ```
-Typical flow: Connect tab → Bluetooth → Find lifeOs port → Connect; then Wi-Fi
-section → SSID/password → Connect. Verify video with
-`python wifi_video_test.py [--com COMx --ssid X --password Y]` (allow inbound UDP
-5010 in the firewall).
+Typical flow: Connect tab → pick the Board → (pair BT / plug in USB) → Find
+lifeOs port → Connect; then Wi-Fi section → SSID/password → Connect; on the S3,
+**Go wireless** once `wifi:connected` shows, then unplug USB. Verify video with
+`python wifi_video_test.py [--com COMx --ssid X --password Y]` (allow inbound
+UDP 5010 in the firewall; the wireless feed needs inbound UDP 5005 too).
 
 ## Documentation upkeep (required with every change)
 
@@ -214,6 +257,24 @@ section → SSID/password → Connect. Verify video with
   `yes (<sha>)`.
 - **`to-do.md`** — keep current: add items as they come up, check them off
   (with a date) when done.
+- **`fixes.md`** — the production backlog: issues diagnosed but deliberately
+  deferred. Each entry: symptom, root cause as established, **all debugging
+  already done** (so it is never redone from scratch), the current
+  workaround, and candidate production fixes. Entries are added only on the
+  user's decision (see below); when one is eventually fixed, annotate it
+  (date + progress.md entry) instead of deleting it.
+
+## Staying on the main goal (defer-or-fix triage)
+
+When a bug or limitation turns out to be an environment/robustness issue
+rather than the feature being built (network policy quirks, firewall/OS
+config, hardware corner cases, "works here but not there" compatibility) —
+or when fixing it properly would clearly derail the current goal — **don't
+silently keep fighting it.** Say so: give a short description of the issue,
+what was already tried, the workaround available now, and a recommendation.
+**The user then decides** whether to fix it now or log it to `fixes.md` for
+later. Precedent: the 2026-07-08 wireless-feed dropout (fixes.md §1) burned a
+session on inter-VLAN UDP filtering that a same-Wi-Fi workaround sidestepped.
 
 ## Git conventions
 

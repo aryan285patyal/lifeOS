@@ -162,3 +162,143 @@ designDecisions.md, and to-do.md.
 - **Why:** GitHub renders the trailer as a co-author badge; the user wants
   commits to show only them.
 - **Pushed:** yes (92fde26)
+
+## 2026-07-07 — ESP32-S3-CAM support: board switch, USB pairing, Go wireless
+- **What:** Firmware gained a compile-time board switch (`BOARD_S3CAM` /
+  `BOARD_WROOM32`: per-board pins + feed transport behind a `linkSendLine`
+  seam). On the S3 (no BT Classic) the sensor/servo feed starts on USB serial
+  and `feed:wifi` moves it onto Wi-Fi UDP (telemetry → laptop:5005, commands
+  on 5006, `hello` re-teaches the IP). GUI: Board dropdown in the Connect tab
+  (persisted), per-board section labels, and a **Go wireless** button that
+  swaps the serial link for the revived `WifiLink` (which got `send_line`).
+  New S3 wiring: SDA 21, SCL 14, INT 47, servos 1/2. README rewritten for both
+  boards; CLAUDE.md/designDecisions §16 updated. Both firmware variants
+  compile (S3: 16MB/OPI fits default partition; WROOM-32: huge_app).
+- **Why:** The new board's camera is the video source the project has been
+  stubbing, but its silicon drops Bluetooth Classic and its camera/SD/USB pins
+  leave only six free GPIOs — so the link, the pins, and the connect flow all
+  had to change together (designDecisions §16).
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Board-aware link naming: no more "Bluetooth COMx" on the S3's USB
+- **What:** `BluetoothLink` (gui.py) now takes a `label` ("Bluetooth" /
+  "USB") that `description()` uses, and `ConnectTab._connect_bt` sets it from
+  the selected board via a new `_link_name()` helper — so the status ticker
+  reads "Connected - USB COMx" on the S3 instead of "Connected - Bluetooth
+  COMx". Disconnect, save-default, and credential-failure messages use the
+  same board-aware wording (the `connect_video` inline pattern was deduped
+  into the helper).
+- **Why:** The S3's CH343 USB COM port rides the same pyserial link class as
+  the WROOM-32's paired-BT COM port, and the hardcoded "Bluetooth" wording
+  misnamed the transport whenever the S3 board was selected (user-reported).
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — "Find lifeOs port": scanning arrow on the port being probed
+- **What:** While the prober walks the COM ports, the list row currently being
+  tried gets a "   <- scanning..." marker (same style as "<- lifeOs").
+  Plumbing: `probe_lifeos_port` gained an optional per-port `progress`
+  callback, `PortProber` a `probing = Signal(str)` emitted through it, and
+  `ConnectTab._on_probe_progress` repopulates the list with the marker
+  (cleared again when the probe finishes, found or not).
+- **Why:** Probing opens each port for up to ~1.5 s; the only feedback was the
+  button saying "Probing...", so the user couldn't tell which port was under
+  scan or how far along the sweep was.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Serial-monitor panel: persistent checkbox + terminal on all tabs
+- **What:** New "Serial monitor" checkbox on the Connect tab (persisted in
+  `connect_config.json` under `serial_monitor`) toggles a terminal-style
+  `SerialMonitorPanel` in the bottom ~quarter of the window, below the tab
+  widget so it shows on every tab. It displays every line received on the
+  active feed link (per-link `raw_log` ring buffer filled in `Link._ingest`,
+  polled at 10 Hz via `raw_since`; divider line on link swaps), has a
+  "Hide telemetry" filter for the 50 Hz `q0:` lines, and a command input +
+  Send that writes raw lines to the ESP32 over the active link.
+- **Why:** Go wireless reports success but telemetry dies after unplugging
+  USB; there was no way to watch the ESP32's replies or poke it with raw
+  commands from the GUI. designDecisions.md §17.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Serial monitor pinned to 1/5 of the window height
+- **What:** The panel's height is now set to `window height // 5` in a
+  `MonitorWindow.resizeEvent` override (layout stretch changed to tabs-take-
+  the-rest), so the proportion holds across resize/maximize/restore.
+- **Why:** Layout stretch factors only split leftover space after size hints,
+  so the "bottom quarter" drifted with tab content; the user wants an exact,
+  window-proportional 1/5. designDecisions.md §17 updated.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Serial monitor: "Hide telemetry" defaults on and persists
+- **What:** The panel's Hide-telemetry checkbox now starts checked and its
+  state is stored in `connect_config.json` (`hide_telemetry`). The panel
+  shares the ConnectTab's config dict (passed into the constructor) so the
+  two writers never save stale copies of each other's keys.
+- **Why:** The panel exists mainly to read control replies; the 50 Hz
+  telemetry firehose should be opt-in, and the choice should survive GUI
+  restarts. designDecisions.md §17 updated.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Serial monitor: [PC]/[ESP] origin tags + button-press logging
+- **What:** Terminal lines are now tagged by origin - `[ESP]` for lines
+  received from the board, `[PC]` for GUI-side events. Every QPushButton
+  press in the main window is logged as a `[PC]` line via a module-level
+  `ui_log` ring buffer and one generic hook (`_hook_button_logging`), stating
+  whether the button is a laptop-side action or commands the ESP32 (an `esp`
+  dynamic property set on Wi-Fi Connect/Disconnect, Go wireless,
+  Reset/Recalibrate, servo Enabled toggles, Upload to ESP32, and Send).
+- **Why:** While debugging the wireless-feed dropout, the terminal should
+  read as a single timeline of what the user did and what the board answered,
+  with the actor of each line unambiguous.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Serial monitor: transport tags ([USB] / [BT] / [WiFi])
+- **What:** Link traffic in the terminal now carries a second tag naming the
+  transport it rode: `[ESP][USB]`, `[ESP][BT]`, `[ESP][WiFi]` on received
+  lines and `[PC][<tag>] > cmd` on sends, via a new `Link.transport_tag()`
+  (BluetoothLink: "USB"/"BT" from its board-aware label; WifiLink: "WiFi").
+- **Why:** The wireless-feed debugging hinges on which pipe a line traveled -
+  after Go wireless the tag flipping from [USB] to [WiFi] (or not) is the
+  evidence.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Wireless-feed dropout diagnosed: Windows Firewall; hint in GUI
+- **What:** Root-caused "Go wireless reports success, then no data after USB
+  unplug": the ESP32 joins Wi-Fi fine (wifi:connected,172.16.72.41) and the
+  laptop's Ethernet subnet (172.17.8.100/20) routes to the ESP's Wi-Fi subnet
+  (ping OK both ways, TTL 61) — but the Ethernet connection is profiled
+  Public and only anaconda's python.exe has inbound firewall allow rules, so
+  the venv-run GUI never receives the ESP's UDP 5005/5010. Added a persistent
+  firewall hint (selectable text, both netsh add-rule commands for
+  UDP 5005/5010) to the Connect tab's Wi-Fi section.
+- **Why:** Any user hitting "wifi:connected but no feed" should find the
+  one-time admin-terminal fix right where they're looking; the agent cannot
+  add firewall rules itself (permission/elevation).
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Wireless dropout, layer 2: campus network drops inter-VLAN UDP
+- **What:** With the lifeOs firewall rules confirmed active (Get-NetFirewallRule),
+  an 8 s listener on UDP 5010 received zero packets while the ESP32 pinged
+  fine (TTL 61) and claimed to be streaming video - so the Apollo-Resident
+  network's inter-VLAN policy passes ICMP but drops unsolicited UDP between
+  the Wi-Fi VLAN (172.16.x, ESP) and the wired VLAN (172.17.x, laptop).
+  Remedy: laptop on the same Wi-Fi as the ESP. Also fixed the reader-thread
+  crash on link swap: `BluetoothLink._run` now catches all exceptions from
+  `readline()` - pyserial raises TypeError (not SerialException) when stop()
+  closes the port mid-read during Go wireless.
+- **Why:** Root-causes "wifi:connected but no feed" beyond the firewall layer;
+  the traceback the user hit at every link swap was noise masking real errors.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — fixes.md production backlog + defer-or-fix triage rule
+- **What:** New `fixes.md` at the repo root: diagnosed-but-deferred issues,
+  each with symptom, root cause, all debugging already done, workaround, and
+  candidate production fixes. Entry 1 is the wireless-feed dropout
+  (firewall layer fixed; inter-VLAN UDP filtering deferred - workaround:
+  laptop on the same Wi-Fi). CLAUDE.md now lists fixes.md in the doc-upkeep
+  rules and adds a "Staying on the main goal" section: when an issue is an
+  environment/robustness rabbit hole, Claude surfaces it with findings +
+  workaround and the user decides fix-now vs. log-to-fixes.md. to-do.md's
+  go-wireless item closed as deferred.
+- **Why:** Keep sessions pointed at the main goal instead of bug fights,
+  without losing the diagnosis work for a future production-hardening pass.
+- **Pushed:** no (uncommitted)

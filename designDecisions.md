@@ -241,3 +241,78 @@ commit 606ae22). Maximizing is inherently screen-bounded, and overriding the
 restore geometry (via `changeEvent` on the maximized→normal transition) guards
 the one path that could reintroduce a bad remembered size — including when
 restoring on a different monitor than the one launched on.
+
+## 16. ESP32-S3-CAM: USB pairing replaces SPP; "Go wireless" = Wi-Fi UDP feed
+
+**Context:** The project is moving to a GoouuuTech **ESP32-S3-CAM**
+(ESP32-S3-WROOM-1 N16R8, OV3660, dual USB-C, microSD) for its onboard camera.
+The S3 silicon has **no Bluetooth Classic** — only BLE — so the SPP
+sensor/servo link (§8) cannot exist there.
+
+**Decision:** Support both boards from one firmware (`#define BOARD_S3CAM` /
+`BOARD_WROOM32` choosing pins + feed transport behind a `linkSendLine` seam)
+and a GUI **Board dropdown**. On the S3 the feed flow is: **USB serial first**
+(the CH343 COM port; the "pairing" step — `id?` + Wi-Fi provisioning over USB,
+exactly what Bluetooth did), then **"Go wireless"** (`feed:wifi`) moves
+telemetry + servo control onto **Wi-Fi UDP** (telemetry → laptop:5005,
+commands in on 5006 — the legacy `WifiLink` ports revived) so the board runs
+untethered. Video (5010) is unchanged; the real OV3660 camera is a follow-up.
+
+**Why USB + Wi-Fi rather than BLE:** a USB COM port carries the existing
+newline protocol with ~zero rework on either end (the GUI's pyserial link and
+port auto-detect work verbatim), while BLE needs a GATT server + an async
+`bleak` client — a rework that buys nothing once the feed can ride Wi-Fi.
+Wi-Fi is also the only transport that will ever carry the camera. The
+client-isolation risk that killed Wi-Fi-as-primary (§8) is mitigated by USB
+always being available as the wired fallback, and an **ESP-NOW dongle**
+(the retired WROOM-32 plugged into the laptop's USB, bridging radio→COM) is
+the noted future fallback for hostile networks. **nRF24L01 was rejected:** its
+SPI needs 5–6 pins and the S3-CAM has exactly six free GPIOs (1, 2, 3, 14, 21,
+47 — camera 4–13/15–18, SD 38–40, LED 48, native USB 19/20, strapping
+0/45/46), all consumed by the MPU (3) and servos (2).
+
+**Pin choices (S3):** SDA 21 / SCL 14 / INT 47 / servos 1, 2; GPIO3 (weakly
+strapping) left as the one spare. `Wire.begin` must pass pins explicitly — the
+S3's Arduino I2C defaults (8/9) are camera data lines. The old map can't work:
+GPIO22/25 don't exist on the S3, and 4/13 are camera pins.
+
+**Cost:** wireless feed quality now depends on the router (use the external
+IPEX antenna); `wifi:off` on the S3 necessarily drops the feed back to USB.
+
+## 17. Serial-monitor panel: a link monitor under the tabs, not a COM-port tool
+
+**Decision:** A "Serial monitor" checkbox on the Connect tab (persisted
+immediately in `connect_config.json` under `serial_monitor`) shows a
+terminal-style panel pinned to **1/5 of the current window height** (re-pinned
+on every resize, so the proportion holds when maximizing/restoring), below the
+tab widget so it is visible on every tab. It displays every line received on the
+**active feed link** — USB serial, paired-BT COM, or the S3's Wi-Fi UDP feed,
+whichever the `ConnectionManager` holds — plus a line input that sends raw
+command lines (`id?`, `debug`, `feed:usb`, ...) over that same link. A
+"Hide telemetry" checkbox filters the ~50 Hz `q0:...` lines so control
+replies stay readable — **on by default** (the panel exists for control
+replies; the telemetry firehose is opt-in) and persisted in
+`connect_config.json` (`hide_telemetry`) like the panel toggle itself. Implementation: `Link._ingest` keeps a per-link ring
+buffer (`raw_log`, 2000 lines) that the panel polls at 10 Hz via
+`raw_since(seq)`; a divider line marks every link swap. Every line carries an
+origin tag — `[ESP]` for lines received from the board, `[PC]` for
+GUI-originated ones — and link traffic adds a transport tag (`[USB]`, `[BT]`,
+or `[WiFi]`, from `Link.transport_tag()` on the active link), e.g.
+`[ESP][WiFi] wifi:connected,...` or `[PC][USB] > id?`. GUI button presses are logged as `[PC]` lines via a
+module-level `ui_log` ring buffer and one generic hook over all
+`QPushButton`s in the main window; each line says whether that button is a
+laptop-side action or commands the ESP32 (an `esp` dynamic property set where
+the ESP-commanding buttons — Wi-Fi Connect/Disconnect, Go wireless,
+Reset/Recalibrate, servo Enabled toggles, Upload, Send — are created).
+Dialog-local buttons (the 6-point wizard) are outside the hook.
+
+**Why a link monitor, not a serial-port monitor:** the interesting failures
+(e.g. Go wireless handing off to a UDP feed that never delivers) live on
+whatever transport currently carries the feed — a literal COM-port monitor
+would go dark exactly when debugging matters most (USB unplugged, feed on
+Wi-Fi). Tapping `Link._ingest` covers every transport with one mechanism and
+zero per-transport code. Below-the-tabs placement (instead of a tab of its
+own) keeps the stream visible while operating other tabs — watching replies
+while pressing Connect/Go wireless is the whole point. Persisting the toggle
+matches the board dropdown's behavior (§16): debugging sessions span many GUI
+restarts.

@@ -54,6 +54,32 @@ check them off (and date them) when done.
 
 ## App
 
+- [x] **ESP32-S3-CAM support (board switch + USB pairing + Go wireless)**
+  *(done 2026-07-07)* — firmware `BOARD_S3CAM`/`BOARD_WROOM32` #define (pins +
+  feed transport), S3 feed = USB serial → `feed:wifi` moves it to Wi-Fi UDP
+  (5005/5006); GUI Board dropdown + Go wireless button; new S3 wiring
+  SDA 21 / SCL 14 / INT 47 / servos 1, 2; README/CLAUDE.md/designDecisions §16.
+  Still to validate on hardware: wire the MPU + servos to the new pins, flash
+  (ESP32S3 Dev Module, 16MB, OPI PSRAM), run the USB → wireless flow end-to-end.
+- [ ] **Real OV3660 camera video** — esp_camera integration on the S3-CAM
+  (PSRAM frame buffers, JPEG), stream over the existing Wi-Fi video path
+  (5010), render in the GUI (Hand Model tab source dropdown). Replaces the
+  synthetic frame stream.
+- [ ] **GUI firmware-flash button** — flash the right firmware for the selected
+  board from the GUI (arduino-cli/esptool under the hood; fold into the
+  Settings menu below). Discuss design first.
+- [ ] **In-GUI wiring diagram per board** — show the selected board's MPU/servo
+  wiring in the Connect tab so the user never wires against the wrong map.
+  Discuss design first.
+- [ ] **BLE feed option (S3)** — wireless without a router: NimBLE GATT server
+  in firmware + async bleak client link in gui.py. Only worth it if Wi-Fi UDP
+  proves unreliable on hostile networks.
+- [ ] **ESP-NOW dongle fallback** — repurpose the retired WROOM-32 as a USB
+  dongle bridging ESP-NOW radio ↔ COM port for router-free wireless telemetry
+  (no video). designDecisions §16.
+- [ ] **Check the S3-CAM's RF-path selector** — if the external IPEX antenna
+  makes no measurable difference, the 0 Ω resistor near the socket is still
+  routed to the PCB antenna.
 - [x] **progress.md changelog + doc-upkeep rules** *(done 2026-07-07)* —
   progress.md logs every change (what / why / timestamp / pushed-to-GitHub
   flag), back-filled from git history and the docs; CLAUDE.md now requires
@@ -76,3 +102,15 @@ check them off (and date them) when done.
     check out a chosen one),
   - flashing firmware to the ESP32 from the GUI (arduino-cli or esptool
     under the hood).
+- [x] **Serial-monitor panel** *(done 2026-07-08)* — Connect-tab checkbox
+  (persisted) showing a terminal box on the bottom quarter of every tab:
+  all lines from the active feed link + raw command input. Built as the
+  debugging endpoint for the go-wireless/UDP-feed dropout.
+- [x] **Go wireless drops telemetry after USB unplug** *(closed 2026-07-08 —
+  deferred to fixes.md §1)* — diagnosed to two layers: laptop firewall
+  (fixed: the two netsh UDP rules now shown in the Connect tab) and the
+  campus network dropping inter-VLAN UDP (unfixable client-side). Workaround:
+  laptop joins the same Wi-Fi as the ESP (set the Laptop IP field to the
+  Wi-Fi adapter's address if Ethernet stays plugged). Production hardening
+  ideas (subnet-mismatch warning, reachability probe + auto-fallback,
+  ESP-NOW dongle) live in fixes.md §1.

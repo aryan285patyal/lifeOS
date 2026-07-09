@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import collections
 import math
 import socket
 import threading
@@ -11,10 +12,10 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QLineEdit, QPushButton, QTabWidget, QTabBar, QSlider, QSpinBox, QDial,
     QGroupBox, QListWidget, QListWidgetItem, QCheckBox, QComboBox, QStackedWidget,
-    QDialog,
+    QDialog, QPlainTextEdit,
 )
 from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal, QEvent
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFontDatabase
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 try:
@@ -47,6 +48,7 @@ SERVO_KEYS = [f"s{i}" for i in range(NUM_SERVOS)]  # echoed angle fields in tele
 UDP_PORT = 5005                       # telemetry port (legacy WiFi sensor mode)
 CMD_PORT = 5006                       # legacy WiFi command/hello port
 VIDEO_PORT = 5010                     # laptop receives Wi-Fi video UDP here (matches lifeOs.ino)
+RAW_LOG_LINES = 2000                  # per-link ring buffer feeding the serial-monitor panel
 
 # mDNS service the ESP32 advertises (MDNS.addService("lifeos", "udp", ...)).
 SERVICE_TYPE = "_lifeos._udp.local."
@@ -68,6 +70,26 @@ def save_connect_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
+
+
+# GUI-side event log (button presses, ...) shown in the serial-monitor panel
+# under the [PC] tag - same ring-buffer/poll pattern as Link.raw_log.
+_ui_log_lock = threading.Lock()
+_ui_log = collections.deque(maxlen=RAW_LOG_LINES)
+_ui_log_seq = 0
+
+
+def ui_log(text):
+    global _ui_log_seq
+    with _ui_log_lock:
+        _ui_log.append((_ui_log_seq, text))
+        _ui_log_seq += 1
+
+
+def ui_log_since(seq):
+    """Buffered GUI-event lines with sequence >= seq, plus the next sequence."""
+    with _ui_log_lock:
+        return [t for s, t in _ui_log if s >= seq], _ui_log_seq
 
 
 # Per-device 6-position calibration results. Accel bias lives in the MPU's
@@ -200,10 +222,11 @@ def list_serial_ports():
     return [(p.device, p.description) for p in lp.comports()]
 
 
-def probe_lifeos_port(timeout=1.5, skip=None):
+def probe_lifeos_port(timeout=1.5, skip=None, progress=None):
     """Open each COM port, ask 'id?', and return the device that answers as a
     lifeOs ESP32 (or is already streaming lifeOs telemetry). None if not found.
-    `skip` is a set of devices to leave alone (e.g. one already open by us)."""
+    `skip` is a set of devices to leave alone (e.g. one already open by us);
+    `progress`, if given, is called with each device just before it is tried."""
     try:
         import serial
     except Exception:
@@ -212,6 +235,8 @@ def probe_lifeos_port(timeout=1.5, skip=None):
     for dev, _desc in list_serial_ports():
         if dev in skip:
             continue
+        if progress:
+            progress(dev)
         try:
             with serial.Serial(dev, 115200, timeout=0.3, write_timeout=0.5) as s:
                 try:
@@ -273,15 +298,20 @@ class Link:
     source differs. Subclasses implement start/stop/send_servos/description."""
 
     # non-telemetry replies the ESP32 sends over the same stream, kept per prefix
-    CONTROL_PREFIXES = ("cal:", "acal:", "wifi:", "id:")
+    CONTROL_PREFIXES = ("cal:", "acal:", "wifi:", "id:", "feed:")
 
     def __init__(self):
         self.lock = threading.Lock()
         self.latest = {}
         self.last_seen = 0.0
         self.controls = {}          # prefix -> (full line, monotonic timestamp)
+        self.raw_log = collections.deque(maxlen=RAW_LOG_LINES)  # (seq, line)
+        self.raw_seq = 0
 
     def _ingest(self, text):
+        with self.lock:
+            self.raw_log.append((self.raw_seq, text))
+            self.raw_seq += 1
         try:
             d = parse_line(text)
         except Exception:
@@ -304,6 +334,16 @@ class Link:
         or (None, 0.0) if none arrived yet."""
         with self.lock:
             return self.controls.get(prefix, (None, 0.0))
+
+    def raw_since(self, seq):
+        """Buffered received lines with sequence >= seq, plus the next sequence
+        to poll from. Feeds the serial-monitor panel."""
+        with self.lock:
+            return [t for s, t in self.raw_log if s >= seq], self.raw_seq
+
+    def transport_tag(self):
+        """Short transport name for the serial-monitor line tags."""
+        return "?"
 
     def is_connected(self, timeout=1.0):
         with self.lock:
@@ -378,32 +418,42 @@ class WifiLink(Link):
         except OSError:
             return False
 
-    def send_servos(self, angles):
+    def send_line(self, text):
+        """Send one control line as a UDP datagram to the ESP32's command port
+        (the S3 firmware dispatches it exactly like a serial/BT line)."""
         with self.lock:
             ip = self.peer_ip
         if not ip:
             return False
-        msg = ",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles))
         try:
-            self.tx_sock.sendto(msg.encode(), (ip, CMD_PORT))
+            self.tx_sock.sendto(text.rstrip().encode(), (ip, CMD_PORT))
             return True
         except OSError:
             return False
+
+    def send_servos(self, angles):
+        return self.send_line(",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)))
 
     def description(self):
         with self.lock:
             ip = self.peer_ip
         return f"Wi-Fi {ip}" if ip else "Wi-Fi (no device)"
 
+    def transport_tag(self):
+        return "WiFi"
+
 
 class BluetoothLink(Link):
-    """Bluetooth Classic SPP over a paired COM port. Same ASCII protocol as
-    WiFi, one newline-delimited line per sample. pyserial is imported lazily so
-    the GUI still runs without it when only WiFi is used."""
+    """Serial COM-port link: Bluetooth Classic SPP (WROOM-32's paired COM port)
+    or plain USB serial (the S3's CH343 COM port) - same ASCII protocol either
+    way, one newline-delimited line per sample. `label` names the transport in
+    user-facing text ("Bluetooth" / "USB"). pyserial is imported lazily so the
+    GUI still runs without it when only WiFi is used."""
 
-    def __init__(self, com):
+    def __init__(self, com, label="Bluetooth"):
         super().__init__()
         self.com = com
+        self.label = label
         self.ser = None
         self._running = False
 
@@ -414,11 +464,12 @@ class BluetoothLink(Link):
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
-        import serial
         while self._running:
             try:
                 raw = self.ser.readline()
-            except (serial.SerialException, OSError):
+            except Exception:
+                # Port gone: unplugged, or stop() closed it mid-readline during
+                # a link swap (pyserial then raises TypeError, not SerialException).
                 break
             if raw:
                 self._ingest(raw.decode(errors="ignore").strip())
@@ -449,7 +500,10 @@ class BluetoothLink(Link):
         return self.send_line(f"wifi:{ssid}|{password}|{ip}")
 
     def description(self):
-        return f"Bluetooth {self.com}"
+        return f"{self.label} {self.com}"
+
+    def transport_tag(self):
+        return "USB" if self.label == "USB" else "BT"
 
 
 class ConnectionManager:
@@ -573,13 +627,109 @@ class PortProber(QObject):
     device via a signal (Qt queues it back onto the GUI thread safely)."""
 
     found = Signal(str)     # matched device, or "" if none
+    probing = Signal(str)   # device currently being tried (one per port)
 
     def probe(self, skip=None):
         threading.Thread(target=self._run, args=(skip,), daemon=True).start()
 
     def _run(self, skip):
-        dev = probe_lifeos_port(skip=skip)
+        dev = probe_lifeos_port(skip=skip, progress=self.probing.emit)
         self.found.emit(dev or "")
+
+
+class SerialMonitorPanel(QWidget):
+    """Terminal-style debugging endpoint shown under the tab widget on every
+    tab: every line received on the active feed link (USB serial or Wi-Fi UDP
+    - whatever the ConnectionManager holds), plus a line input to send raw
+    commands to the ESP32. Toggled by the Connect tab's Serial monitor
+    checkbox."""
+
+    POLL_MS = 100
+
+    def __init__(self, manager, config):
+        super().__init__()
+        self.manager = manager
+        self.config = config        # ConnectTab's dict - shared so neither
+                                    # writer saves a stale copy of the other's keys
+        self._link = None           # link object we last polled
+        self._seq = 0               # next raw_since() sequence on that link
+        self._ui_seq = 0            # next ui_log_since() sequence
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(4)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setMaximumBlockCount(RAW_LOG_LINES)
+        self.view.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.view.setStyleSheet(
+            "QPlainTextEdit { background: #101418; color: #c8d2dc; }")
+        v.addWidget(self.view, 1)
+
+        row = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("command to the ESP32 (e.g. id?, debug, feed:usb)")
+        self.input.returnPressed.connect(self._send)
+        row.addWidget(self.input, 1)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setProperty("esp", True)
+        self.send_btn.clicked.connect(self._send)
+        row.addWidget(self.send_btn)
+        self.hide_telemetry = QCheckBox("Hide telemetry")
+        self.hide_telemetry.setToolTip(
+            "Skip the ~50 Hz q0:... telemetry lines so replies stay readable.")
+        self.hide_telemetry.setChecked(bool(self.config.get("hide_telemetry", True)))
+        self.hide_telemetry.toggled.connect(self._hide_telemetry_toggled)
+        row.addWidget(self.hide_telemetry)
+        v.addLayout(row)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(self.POLL_MS)
+
+    def _append(self, lines):
+        """Append lines, auto-scrolling only if the user was at the bottom."""
+        if not lines:
+            return
+        bar = self.view.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        self.view.appendPlainText("\n".join(lines))
+        if at_bottom:
+            bar.setValue(bar.maximum())
+
+    def _poll(self):
+        if not self.isVisible():
+            return
+        ui_lines, self._ui_seq = ui_log_since(self._ui_seq)
+        self._append([f"[PC] {t}" for t in ui_lines])
+        link = self.manager.active
+        if link is not self._link:
+            self._link = link
+            self._seq = 0
+            self._append([f"--- {link.description() if link else 'no link'} ---"])
+        if not link:
+            return
+        lines, self._seq = link.raw_since(self._seq)
+        if self.hide_telemetry.isChecked():
+            lines = [t for t in lines if not t.startswith("q0:")]
+        tag = link.transport_tag()
+        self._append([f"[ESP][{tag}] {t}" for t in lines])
+
+    def _hide_telemetry_toggled(self, checked):
+        self.config["hide_telemetry"] = bool(checked)
+        save_connect_config(self.config)
+
+    def _send(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        link = self.manager.active
+        if self.manager.send_line(text):
+            self._append([f"[PC][{link.transport_tag()}] > {text}"])
+            self.input.clear()
+        else:
+            self._append([f"[PC] > {text}", "[PC] send failed - no link or write error"])
 
 
 class OrientationBridge(QObject):
@@ -756,6 +906,7 @@ class ServoTab(QWidget):
             # enable/disable: disabling detaches the servo on the ESP32 (no PWM
             # pulses, the horn goes limp) - an active off, not just "stop sending"
             en_btn = QPushButton("Enabled")
+            en_btn.setProperty("esp", True)
             en_btn.setCheckable(True)
             en_btn.setChecked(True)
             en_btn.toggled.connect(lambda on, idx=i: self._toggle_enable(idx, on))
@@ -789,6 +940,7 @@ class ServoTab(QWidget):
             self.dial_labels.append(dlabel)
 
         self.upload_btn = QPushButton("Upload to ESP32")
+        self.upload_btn.setProperty("esp", True)
         self.upload_btn.clicked.connect(self.upload)
         root.addWidget(self.upload_btn)
 
@@ -863,15 +1015,22 @@ class ServoTab(QWidget):
 
 
 class ConnectTab(QWidget):
-    """Set up the ESP32's two channels, in two sections:
+    """Set up the ESP32's channels. A Board dropdown picks the flow:
 
-    * Bluetooth (sensor & servos) -- pick the paired COM port ("Find lifeOs port"
-      auto-detects it), Connect, optionally Save as default. This is the always-on
-      control link the Monitor/Visualizer/Servos tabs read from.
-    * Wi-Fi (video) -- enter the Wi-Fi SSID/password and confirm the laptop IP,
-      then Connect: these are sent to the ESP32 OVER BLUETOOTH, and the ESP32
-      brings up Wi-Fi and streams video UDP back to that IP. Sending the laptop's
-      current IP each time sidesteps the changing-DHCP-address problem."""
+    * ESP-WROOM-32 -- Bluetooth SPP is the sensor/servo feed: pick the paired
+      COM port ("Find lifeOs port" auto-detects it), Connect. Wi-Fi (video)
+      creds are then sent over Bluetooth.
+    * ESP32-S3-CAM -- no BT Classic on the S3, so the feed starts on USB: plug
+      the board's COM USB-C port in, pick/auto-detect the COM port, Connect
+      ("pairing"). Wi-Fi creds go over USB; once 'wifi:connected' arrives, the
+      "Go wireless" button moves the sensor/servo feed onto Wi-Fi UDP (the
+      firmware's feed:wifi), after which the USB cable can be unplugged.
+
+    Either way the laptop's current IP is sent with the creds, sidestepping the
+    changing-DHCP-address problem."""
+
+    BOARDS = [("wroom32", "ESP-WROOM-32 (Bluetooth)"),
+              ("s3cam", "ESP32-S3-CAM (USB + Wi-Fi)")]
 
     def __init__(self, manager):
         super().__init__()
@@ -879,10 +1038,12 @@ class ConnectTab(QWidget):
         self.config = load_connect_config()
         self._bt_rows = []             # row -> (com_device, description)
         self._detected_bt = None       # COM port confirmed to be lifeOs, if any
+        self._probing_dev = None       # COM port the prober is trying right now
         self._auto_bt_attempted = False
         self._auto_video_attempted = False
         self.prober = PortProber()
         self.prober.found.connect(self._on_probe_found)
+        self.prober.probing.connect(self._on_probe_progress)
 
         root = QVBoxLayout(self)
 
@@ -893,6 +1054,27 @@ class ConnectTab(QWidget):
         title.setAlignment(Qt.AlignCenter)
         root.addWidget(title)
 
+        board_row = QHBoxLayout()
+        board_row.addWidget(QLabel("Board:"))
+        self.board_combo = QComboBox()
+        for _key, label in self.BOARDS:
+            self.board_combo.addItem(label)
+        saved_board = self.config.get("board", "wroom32")
+        for i, (key, _label) in enumerate(self.BOARDS):
+            if key == saved_board:
+                self.board_combo.setCurrentIndex(i)
+                break
+        self.board_combo.currentIndexChanged.connect(self._board_changed)
+        board_row.addWidget(self.board_combo, 1)
+        self.serial_monitor_check = QCheckBox("Serial monitor")
+        self.serial_monitor_check.setToolTip(
+            "Show a terminal box (bottom of every tab) with everything the "
+            "ESP32 sends on the feed link, plus a command input.")
+        self.serial_monitor_check.setChecked(bool(self.config.get("serial_monitor", False)))
+        self.serial_monitor_check.toggled.connect(self._serial_monitor_toggled)
+        board_row.addWidget(self.serial_monitor_check)
+        root.addLayout(board_row)
+
         self.status_label = QLabel("Not connected.")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setWordWrap(True)
@@ -901,15 +1083,58 @@ class ConnectTab(QWidget):
         root.addWidget(self._build_bt_group())
         root.addWidget(self._build_video_group())
         root.addStretch(1)
+        self._apply_board_labels()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(1000)
         self.refresh_bt()
 
-    # --- Bluetooth (sensor & servos) ---
+    def board(self):
+        """Selected board key: 'wroom32' or 's3cam'."""
+        return self.BOARDS[self.board_combo.currentIndex()][0]
+
+    def _link_name(self):
+        """What the selected board's serial feed is called in user-facing text."""
+        return "USB" if self.board() == "s3cam" else "Bluetooth"
+
+    def _board_changed(self):
+        self.config["board"] = self.board()
+        save_connect_config(self.config)     # the dropdown persists immediately
+        self._apply_board_labels()
+
+    def _serial_monitor_toggled(self, checked):
+        self.config["serial_monitor"] = bool(checked)
+        save_connect_config(self.config)     # persists immediately, like the board
+
+    def _apply_board_labels(self):
+        """Re-title the two sections for the selected board's flow."""
+        if self.board() == "s3cam":
+            self.bt_box.setTitle("USB  -  pairing, sensor & servos")
+            self.bt_hint.setText(
+                "Plug the board's COM USB-C port into the laptop, then "
+                "\"Find lifeOs port\" to auto-detect which COM it is.")
+            self.video_box.setTitle("Wi-Fi  -  video & wireless feed")
+            self.video_hint.setText(
+                f"Credentials go to the ESP32 over USB; it streams video UDP to "
+                f"Laptop IP:{VIDEO_PORT}. After 'wifi:connected', Go wireless "
+                f"moves the sensor/servo feed onto Wi-Fi so USB can be unplugged.")
+            self.go_wireless_btn.setVisible(True)
+        else:
+            self.bt_box.setTitle("Bluetooth  -  sensor & servos")
+            self.bt_hint.setText(
+                "Pair the ESP32 (\"lifeos\") in Windows Bluetooth first, then "
+                "\"Find lifeOs port\" to auto-detect which COM it is.")
+            self.video_box.setTitle("Wi-Fi  -  video")
+            self.video_hint.setText(
+                f"Credentials go to the ESP32 over Bluetooth; it then streams video "
+                f"UDP to Laptop IP:{VIDEO_PORT}. Verify with wifi_video_test.py.")
+            self.go_wireless_btn.setVisible(False)
+
+    # --- Bluetooth / USB serial (sensor & servos; titled per board) ---
     def _build_bt_group(self):
         box = QGroupBox("Bluetooth  -  sensor & servos")
+        self.bt_box = box
         v = QVBoxLayout(box)
         self.bt_list = QListWidget()
         self.bt_list.itemDoubleClicked.connect(lambda _: self.connect_bt())
@@ -929,8 +1154,10 @@ class ConnectTab(QWidget):
                   self.bt_disconnect_btn, self.bt_default_btn):
             row.addWidget(b)
         v.addLayout(row)
-        v.addWidget(QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth first, then "
-                           "\"Find lifeOs port\" to auto-detect which COM it is."))
+        self.bt_hint = QLabel("Pair the ESP32 (\"lifeos\") in Windows Bluetooth first, then "
+                              "\"Find lifeOs port\" to auto-detect which COM it is.")
+        self.bt_hint.setWordWrap(True)
+        v.addWidget(self.bt_hint)
         return box
 
     def _populate_bt(self):
@@ -944,6 +1171,8 @@ class ConnectTab(QWidget):
             label = f"{dev}    {desc}"
             if dev == self._detected_bt:
                 label += "   <- lifeOs"
+            if dev == self._probing_dev:
+                label += "   <- scanning..."
             self.bt_list.addItem(label)
             self._bt_rows.append((dev, desc))
         if not self._bt_rows:
@@ -967,9 +1196,16 @@ class ConnectTab(QWidget):
         self.status_label.setText("Probing COM ports for lifeOs (opens each briefly)...")
         self.prober.probe(skip=skip)
 
+    def _on_probe_progress(self, dev):
+        """Worker is about to try this port - mark its row so the user can
+        follow the scan."""
+        self._probing_dev = dev
+        self._populate_bt()
+
     def _on_probe_found(self, dev):
         self.bt_find_btn.setEnabled(True)
         self.bt_find_btn.setText("Find lifeOs port")
+        self._probing_dev = None
         if dev:
             self._detected_bt = dev
             self._populate_bt()
@@ -979,6 +1215,7 @@ class ConnectTab(QWidget):
                     break
             self.status_label.setText(f"Found lifeOs on {dev}. Press Connect.")
         else:
+            self._populate_bt()        # erase the last scanning marker
             self.status_label.setText(
                 "No lifeOs device found on any COM port. Is it paired and powered on?")
 
@@ -991,25 +1228,28 @@ class ConnectTab(QWidget):
 
     def _connect_bt(self, com):
         try:
-            link = BluetoothLink(com)
+            link = BluetoothLink(com, label=self._link_name())
             link.start()                        # opens the serial port; may raise
         except Exception as e:
             self.status_label.setText(f"Could not open {com}: {e}")
             return
         self.manager.set_active(link)
+        if self.board() == "s3cam":
+            link.send_line("feed:usb")          # reclaim the feed if it was Wi-Fi
         self.status_label.setText(f"Opened {com} - waiting for sensor telemetry...")
 
     def disconnect_bt(self):
         """Active disconnect: closing the COM port tears the SPP link down, so
         the ESP32 sees its Bluetooth client vanish (hasClient() goes false)."""
         if not isinstance(self.manager.active, BluetoothLink):
-            self.status_label.setText("No Bluetooth link to disconnect.")
+            self.status_label.setText(f"No {self._link_name()} link to disconnect.")
             return
         com = self.manager.active.com
+        label = self.manager.active.label
         self.manager.disconnect()
         self.status_label.setStyleSheet("")
         self.status_label.setText(
-            f"Bluetooth disconnected ({com} closed). Wi-Fi video, if running, "
+            f"{label} disconnected ({com} closed). Wi-Fi video, if running, "
             f"continues until you stop it or re-provision.")
 
     def save_bt_default(self):
@@ -1019,11 +1259,13 @@ class ConnectTab(QWidget):
             return
         self.config["bt_port"] = self._bt_rows[r][0]
         save_connect_config(self.config)
-        self.status_label.setText(f"Saved {self._bt_rows[r][0]} as the default Bluetooth port.")
+        self.status_label.setText(
+            f"Saved {self._bt_rows[r][0]} as the default {self._link_name()} port.")
 
-    # --- Wi-Fi (video) ---
+    # --- Wi-Fi (video; on the S3 also the wireless sensor/servo feed) ---
     def _build_video_group(self):
         box = QGroupBox("Wi-Fi  -  video")
+        self.video_box = box
         form = QVBoxLayout(box)
 
         ssid_row = QHBoxLayout()
@@ -1049,24 +1291,53 @@ class ConnectTab(QWidget):
 
         row = QHBoxLayout()
         self.video_connect_btn = QPushButton("Connect (start video)")
+        self.video_connect_btn.setProperty("esp", True)
         self.video_connect_btn.clicked.connect(self.connect_video)
         self.video_disconnect_btn = QPushButton("Disconnect (stop video)")
+        self.video_disconnect_btn.setProperty("esp", True)
         self.video_disconnect_btn.clicked.connect(self.disconnect_video)
+        self.go_wireless_btn = QPushButton("Go wireless")
+        self.go_wireless_btn.setProperty("esp", True)
+        self.go_wireless_btn.setToolTip(
+            "Move the sensor/servo feed onto Wi-Fi UDP (feed:wifi); "
+            "after this the USB cable can be unplugged.")
+        self.go_wireless_btn.clicked.connect(self.go_wireless)
         self.video_default_btn = QPushButton("Save as default")
         self.video_default_btn.clicked.connect(self.save_video_default)
         row.addWidget(self.video_connect_btn)
         row.addWidget(self.video_disconnect_btn)
+        row.addWidget(self.go_wireless_btn)
         row.addWidget(self.video_default_btn)
         form.addLayout(row)
 
-        form.addWidget(QLabel(f"Credentials go to the ESP32 over Bluetooth; it then streams video "
-                              f"UDP to Laptop IP:{VIDEO_PORT}. Verify with wifi_video_test.py."))
+        self.video_hint = QLabel(f"Credentials go to the ESP32 over Bluetooth; it then streams video "
+                                 f"UDP to Laptop IP:{VIDEO_PORT}. Verify with wifi_video_test.py.")
+        self.video_hint.setWordWrap(True)
+        form.addWidget(self.video_hint)
+
+        # The most common "wifi:connected but no data arrives" cause is the
+        # Windows firewall silently dropping the inbound UDP, especially on a
+        # network profiled as Public. Keep the one-time fix in sight.
+        self.firewall_hint = QLabel(
+            f"No Wi-Fi feed/video coming in even though the ESP32 says "
+            f"wifi:connected? Windows Firewall is likely dropping the inbound "
+            f"UDP. Run once in an administrator terminal:\n"
+            f'netsh advfirewall firewall add rule name="lifeOs feed UDP {UDP_PORT}" '
+            f"dir=in action=allow protocol=UDP localport={UDP_PORT}\n"
+            f'netsh advfirewall firewall add rule name="lifeOs video UDP {VIDEO_PORT}" '
+            f"dir=in action=allow protocol=UDP localport={VIDEO_PORT}")
+        self.firewall_hint.setWordWrap(True)
+        self.firewall_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.firewall_hint.setStyleSheet("color: #888888; font-size: 8pt;")
+        form.addWidget(self.firewall_hint)
         return box
 
     def connect_video(self):
         if not isinstance(self.manager.active, BluetoothLink):
+            link_name = self._link_name()
             self.status_label.setText(
-                "Connect over Bluetooth first - Wi-Fi credentials are sent to the ESP32 over Bluetooth.")
+                f"Connect over {link_name} first - Wi-Fi credentials are sent "
+                f"to the ESP32 over {link_name}.")
             return
         ssid = self.ssid_edit.text().strip()
         password = self.pass_edit.text()
@@ -1079,21 +1350,48 @@ class ConnectTab(QWidget):
                 f"Sent Wi-Fi creds to ESP32 (SSID '{ssid}', video -> {ip}:{VIDEO_PORT}). "
                 f"Run wifi_video_test.py to verify.")
         else:
-            self.status_label.setText("Failed to send credentials over Bluetooth.")
+            self.status_label.setText(
+                f"Failed to send credentials over {self.manager.active.label}.")
 
     def disconnect_video(self):
-        """Active disconnect: 'wifi:off' over Bluetooth makes the ESP32 stop the
-        video stream and switch its Wi-Fi radio off (until re-provisioned),
-        instead of us merely ignoring incoming packets."""
-        if not isinstance(self.manager.active, BluetoothLink):
-            self.status_label.setText(
-                "Bluetooth link needed to stop video - 'wifi:off' is sent over Bluetooth.")
-            return
+        """Active disconnect: 'wifi:off' makes the ESP32 stop the video stream
+        and switch its Wi-Fi radio off (until re-provisioned), instead of us
+        merely ignoring incoming packets. Note: on the S3 this also kills a
+        wireless sensor feed - the firmware drops back to USB."""
         if self.manager.send_line("wifi:off"):
             self.status_label.setText(
                 "Sent wifi:off - the ESP32 stops streaming and turns its Wi-Fi off.")
         else:
-            self.status_label.setText("Failed to send wifi:off over Bluetooth.")
+            self.status_label.setText(
+                "Failed to send wifi:off - no active link to the ESP32.")
+
+    def go_wireless(self):
+        """S3 flow: move the sensor/servo feed from USB onto Wi-Fi UDP. Sends
+        'feed:wifi' over the serial link, then swaps the active link for a
+        WifiLink aimed at the ESP32's IP (from the wifi:connected reply)."""
+        if not isinstance(self.manager.active, BluetoothLink):
+            self.status_label.setText(
+                "Connect over USB first (the go-wireless command rides USB).")
+            return
+        reply, _ts = self.manager.control("wifi:")
+        esp_ip = None
+        if reply and reply.startswith("wifi:connected,"):
+            esp_ip = reply.split(",", 1)[1].strip()
+        if not esp_ip:
+            self.status_label.setText(
+                "Provision Wi-Fi first (Connect video) and wait for "
+                "'wifi:connected' before going wireless.")
+            return
+        if not self.manager.send_line("feed:wifi"):
+            self.status_label.setText("Could not send feed:wifi over USB.")
+            return
+        link = WifiLink()
+        link.start()
+        link.register_peer(esp_ip)      # 'hello' re-teaches the ESP32 our IP
+        self.manager.set_active(link)   # stops the serial link, frees the COM port
+        self.status_label.setText(
+            f"Feed is wireless - telemetry via UDP from {esp_ip}. "
+            f"You can unplug the USB cable now.")
 
     def save_video_default(self):
         self.config["video_ssid"] = self.ssid_edit.text().strip()
@@ -1592,6 +1890,7 @@ class MonitorWindow(QMainWindow):
         # --- Reset / recalibrate (zero the sensor) + the six-position wizard ---
         btn_row = QHBoxLayout()
         self.reset_btn = QPushButton("Reset / Recalibrate")
+        self.reset_btn.setProperty("esp", True)
         self.reset_btn.clicked.connect(self.start_calibration)
         btn_row.addWidget(self.reset_btn)
         self.sixcal_btn = QPushButton("6-Point Calibration...")
@@ -1619,7 +1918,21 @@ class MonitorWindow(QMainWindow):
         tabs.addTab(self.servos, "Servos")
         self.hand_model = HandModelTab()
         tabs.addTab(self.hand_model, "Hand Model")
-        self.setCentralWidget(tabs)
+
+        # Tabs on top, the serial-monitor terminal pinned to 1/5 of the window
+        # height (kept proportional in resizeEvent) on every tab; visibility
+        # follows the Connect tab's persisted checkbox.
+        container = QWidget()
+        cv = QVBoxLayout(container)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        cv.addWidget(tabs, 1)
+        self.serial_monitor = SerialMonitorPanel(self.listener, self.connect_tab.config)
+        cv.addWidget(self.serial_monitor)
+        self.serial_monitor.setVisible(self.connect_tab.serial_monitor_check.isChecked())
+        self.connect_tab.serial_monitor_check.toggled.connect(self.serial_monitor.setVisible)
+        self.setCentralWidget(container)
+        self._hook_button_logging()
 
         self._build_status_bar()
         self._apply_standard_size()   # the geometry "restore down" returns to
@@ -1640,6 +1953,25 @@ class MonitorWindow(QMainWindow):
         frame.moveCenter(avail.center())
         self.move(frame.topLeft())
 
+    def _hook_button_logging(self):
+        """Every button press lands in the serial-monitor terminal as a [PC]
+        line, saying whether that button acts on the laptop or commands the
+        ESP32 (the 'esp' dynamic property, set where each button is created).
+        Connected after the real handlers, so the press is logged with the
+        label the user actually clicked."""
+        for btn in self.findChildren(QPushButton):
+            btn.clicked.connect(
+                lambda _=False, b=btn: ui_log(
+                    f"pressed '{b.text()}' - "
+                    + ("commands the ESP32" if b.property("esp")
+                       else "laptop-side action")))
+
+    def resizeEvent(self, event):
+        # Keep the serial monitor at 1/5 of the current window height (layout
+        # stretch factors only split leftover space, so pin it explicitly).
+        self.serial_monitor.setFixedHeight(self.height() // 5)
+        super().resizeEvent(event)
+
     def changeEvent(self, event):
         if (event.type() == QEvent.WindowStateChange
                 and event.oldState() & Qt.WindowMaximized
@@ -1655,21 +1987,21 @@ class MonitorWindow(QMainWindow):
         """Bottom-left indicators, one colored box per source, tick/cross by
         whether we've had a live signal in the last second."""
         bar = self.statusBar()
-        self.dot_bt = StatusDot("Bluetooth", "#1565c0")   # blue
+        self.dot_bt = StatusDot("Feed link (BT / USB / Wi-Fi UDP)", "#1565c0")  # blue
         self.dot_wifi = StatusDot("Wi-Fi", "#2e7d32")     # green
         self.dot_s1 = StatusDot("Servo 1", "#c62828")     # red
         self.dot_s2 = StatusDot("Servo 2", "#c62828")     # red
         self.dot_mpu = StatusDot("MPU", "#f9a825")        # yellow
-        for caption, dot in [("BT", self.dot_bt), ("WiFi", self.dot_wifi),
+        for caption, dot in [("Link", self.dot_bt), ("WiFi", self.dot_wifi),
                              ("S1", self.dot_s1), ("S2", self.dot_s2), ("MPU", self.dot_mpu)]:
             bar.addWidget(QLabel(caption))
             bar.addWidget(dot)
 
     def _update_status_dots(self, values, connected):
-        # Everything is reported over the (Bluetooth) telemetry stream, so all
-        # dots are cross when it isn't fresh. `connected` == signal within 1s.
-        is_bt = isinstance(getattr(self.listener, "active", None), BluetoothLink)
-        self.dot_bt.set_live(connected and is_bt)
+        # Everything is reported over the one telemetry stream (BT, USB serial,
+        # or Wi-Fi UDP depending on board/feed), so all dots are cross when it
+        # isn't fresh. `connected` == signal within 1s on the active link.
+        self.dot_bt.set_live(connected)
         self.dot_wifi.set_live(connected and int(values.get("wf", 0)) == 1)
         # a disabled (detached) servo counts as not live; older firmware without
         # the e0/e1 fields is treated as enabled

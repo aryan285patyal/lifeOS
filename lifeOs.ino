@@ -1,67 +1,115 @@
-// lifeOs.ino  --  ESP32 + MPU6050 (DMP): Bluetooth sensor/servo link + Wi-Fi video
+// lifeOs.ino  --  ESP32 + MPU6050 (DMP): sensor/servo link + Wi-Fi video
 //
-// Two concurrent channels, each playing to its strength:
-//   * BLUETOOTH (Classic SPP, always on) -- sensor telemetry out (quaternion +
-//     raw counts + servo echo), servo commands in, and Wi-Fi PROVISIONING in.
-//     Reliable, network-independent, keeps the laptop's Wi-Fi free.
-//   * WI-FI (station, on demand) -- high-bandwidth VIDEO out over UDP. Brought
-//     up only after the laptop sends Wi-Fi credentials + its own IP over
-//     Bluetooth, so a changing laptop DHCP address is handled every boot and
-//     nothing is hardcoded. (Camera is future work; for now a synthetic frame
-//     stream lets us test the Wi-Fi path.)
+// Two boards, one firmware (select below):
+//   * BOARD_WROOM32 (ESP-WROOM-32): the sensor/control feed is BLUETOOTH
+//     Classic SPP (always on) -- reliable, network-independent, keeps the
+//     laptop's Wi-Fi free.
+//   * BOARD_S3CAM (GoouuuTech ESP32-S3-CAM, WROOM-1 N16R8 + OV3660): the S3
+//     has NO Bluetooth Classic, so the feed starts on USB SERIAL (the CH343
+//     "COM" USB-C port; same newline protocol). After Wi-Fi is provisioned
+//     over USB, "feed:wifi" moves the sensor/servo feed onto Wi-Fi UDP
+//     (telemetry -> laptop:5005, commands in on 5006) so the board can run
+//     untethered; "feed:usb" brings it back.
 //
-// Provisioning line (over Bluetooth):  wifi:<ssid>|<password>|<laptop_ip>
-// Stop video / Wi-Fi off (Bluetooth):  wifi:off  ->  wifi:off,ok
-// Identity query (over Bluetooth):     id?  ->  id:lifeos,proto:1,servos:N
-// IMU recalibration (over Bluetooth):  cal  ->  cal:start ... cal:done
-//   (re-runs the GYRO bias calibration; keep the sensor still ~2 s in any
-//    orientation; telemetry pauses while it runs. Accel offsets are never
-//    touched here -- see recalibrateImu() for why the library's accel cal
-//    is broken; use the GUI's 6-position wizard instead)
-// 6-position accel cal (Bluetooth):    acal:set,<bx>,<by>,<bz>  ->  acal:ok,<ox>,<oy>,<oz>
-//   (per-axis accel bias in raw +/-2g counts, solved by the GUI's six-face
-//    wizard; converted to hardware offset-register units, written to the MPU,
-//    and persisted in NVS so they survive power cycles)
-//   acal:clear  ->  acal:cleared  (drop stored offsets; next boot auto-cals)
-// Servo enable/disable (Bluetooth):    e0:1,e1:0  (0 = detach, servo goes limp)
-// Debug echo (USB serial monitor):     debug  ->  toggles echoing every BT
-//   telemetry line to USB Serial (plus a 1 Hz Wi-Fi/video status line and the
-//   stored acal offsets on enable), whether or not a BT client is connected.
+// Either way, WI-FI (station, on demand) carries high-bandwidth VIDEO over
+// UDP (port 5010). It is brought up only after the laptop sends Wi-Fi
+// credentials + its own IP over the feed link, so a changing laptop DHCP
+// address is handled every session and nothing is hardcoded. (Real camera is
+// future work; for now a synthetic frame stream tests the Wi-Fi path.)
 //
-// Concurrency: an IMU task on core 0 drains the DMP FIFO (interrupt on GPIO4);
-// loop() on core 1 runs Bluetooth + the Wi-Fi video sender.
+// Control lines (over the active feed link):
+//   wifi:<ssid>|<password>|<laptop_ip>   provision Wi-Fi -> wifi:connected,<ip>
+//   wifi:off                             stop video + radio -> wifi:off,ok
+//   id?                                  -> id:lifeos,proto:1,servos:N,board:<b>
+//   cal                                  gyro bias recal -> cal:start ... cal:done
+//     (keep the sensor still ~2 s, any orientation; telemetry pauses. Accel
+//      offsets are never touched here -- see recalibrateImu() for why the
+//      library's accel cal is broken; use the GUI's 6-position wizard)
+//   acal:set,<bx>,<by>,<bz>              -> acal:ok,<ox>,<oy>,<oz>
+//     (per-axis accel bias in raw +/-2g counts from the GUI's six-face wizard;
+//      converted to offset-register units, written to the MPU, persisted in NVS)
+//   acal:clear                           -> acal:cleared (next boot auto-cals)
+//   e0:1,e1:0                            servo enable/disable (0 = detach/limp)
+//   feed:wifi / feed:usb                 S3 only: move the feed to Wi-Fi UDP / back
+//   debug                                toggle telemetry echo + 1 Hz status on
+//                                        the USB serial monitor
 //
-// Libraries: "MPU6050" by Electronic Cats, "ESP32Servo". WiFi/WiFiUdp/
-// BluetoothSerial ship with the ESP32 core. BT + Wi-Fi + the DMP blob need a
-// large partition scheme (Tools > Partition Scheme > "Huge APP").
+// Concurrency: an IMU task on core 0 drains the DMP FIFO (INT pin interrupt);
+// loop() on core 1 runs the feed link + the Wi-Fi video sender.
+//
+// Libraries: "MPU6050" by Electronic Cats, "ESP32Servo". WiFi/WiFiUdp (and
+// BluetoothSerial on the WROOM-32) ship with the ESP32 core.
+// Partitions: WROOM-32 needs Tools > Partition Scheme > "Huge APP" (BT + Wi-Fi
+// + DMP blob overflow the default). S3-CAM (16 MB flash) fits the default
+// 16 MB scheme; select board "ESP32S3 Dev Module", Flash 16MB, PSRAM "OPI".
+
+// --- Board selection: exactly one. Chooses pins + the feed transport. ---
+#define BOARD_S3CAM        // GoouuuTech ESP32-S3-CAM (ESP32-S3-WROOM-1 N16R8)
+//#define BOARD_WROOM32    // classic ESP-WROOM-32 dev board
+
+#if defined(BOARD_S3CAM) && defined(BOARD_WROOM32)
+#error "Select exactly one board (BOARD_S3CAM or BOARD_WROOM32)"
+#endif
+#if !defined(BOARD_S3CAM) && !defined(BOARD_WROOM32)
+#error "Select a board: BOARD_S3CAM or BOARD_WROOM32"
+#endif
 
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
 #include <ESP32Servo.h>
-#include "BluetoothSerial.h"
+#if defined(BOARD_WROOM32)
+#include "BluetoothSerial.h"       // BT Classic: exists only on the WROOM-32
+#endif
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
+#include <stdarg.h>
 
-#define INTERRUPT_PIN 4              // MPU6050 INT -> ESP32 GPIO4
-const char*  BT_NAME       = "lifeos";
 const long   interval      = 20;     // sensor TX period, ms (50 Hz)
 const int    VIDEO_PORT    = 5010;   // laptop receives video UDP here
 const size_t VIDEO_PKT     = 1024;   // synthetic video packet size, bytes
 const long   videoInterval = 20;     // video frame period, ms
 
-// --- Servos: GPIOs clear of the MPU (I2C 21/22, INT 4), flash, strapping and
-// input-only pins. Signal wire only; power servos from a separate 5-6V supply
-// sharing ground with the ESP32. ---
+// --- Pins + servo count per board. Signal wire only; power servos from a
+// separate 5-6V supply sharing ground with the ESP32. ---
 #define NUM_SERVOS 2
+#if defined(BOARD_S3CAM)
+// The S3-CAM's only free GPIOs are 1, 2, 3, 14, 21, 47: the camera owns
+// 4-13/15-18, the SD slot 38-40, the WS2812 LED 48, native USB 19/20, and
+// 0/45/46 are strapping pins. GPIO3 (strapping-ish) is left as the spare.
+#define PIN_SDA 21                   // MPU6050 SDA
+#define PIN_SCL 14                   // MPU6050 SCL
+#define INTERRUPT_PIN 47             // MPU6050 INT
+const int SERVO_PINS[NUM_SERVOS] = {1, 2};
+#define BOARD_NAME "s3cam"
+#else
+#define PIN_SDA 21                   // MPU6050 SDA
+#define PIN_SCL 22                   // MPU6050 SCL
+#define INTERRUPT_PIN 4              // MPU6050 INT
 const int SERVO_PINS[NUM_SERVOS] = {13, 25};
+#define BOARD_NAME "wroom32"
+#endif
+
 Servo servos[NUM_SERVOS];
 int   servoPos[NUM_SERVOS] = {90, 90};   // last commanded angle; echoed in telemetry
 bool  servoEnabled[NUM_SERVOS] = {true, true};  // detached (limp) when false; echoed as e0/e1
 
 MPU6050 mpu;
+#if defined(BOARD_WROOM32)
+const char* BT_NAME = "lifeos";
 BluetoothSerial SerialBT;
+#else
+// S3 sensor/servo feed: USB serial by default; "feed:wifi" moves it to Wi-Fi
+// UDP (telemetry out to laptop:UDP_PORT, command lines in on CMD_PORT --
+// matches gui.py's WifiLink, which also sends "hello" to re-teach our peer IP).
+const int UDP_PORT = 5005;           // telemetry -> laptop (matches gui.py)
+const int CMD_PORT = 5006;           // command/hello listener (matches gui.py)
+WiFiUDP dataUdp;                     // telemetry out while the feed is Wi-Fi
+WiFiUDP cmdUdp;                      // command listener on CMD_PORT
+bool    feedWifi = false;            // true = feed rides Wi-Fi UDP, not USB
+bool    cmdUdpUp = false;            // cmdUdp.begin() done
+#endif
 
 // --- 6-position accel calibration: offset-register values persisted in NVS
 // (the chip loses them on power cycle; dmpInitialize() also resets them) ---
@@ -162,8 +210,33 @@ void imuTask(void *param) {
 
 
 // ---------------------------------------------------------------------------
-// Bluetooth: sensor telemetry out; commands + provisioning in.
+// Feed link: sensor telemetry out; commands + provisioning in. The transport
+// differs per board (BT SPP / USB serial / Wi-Fi UDP) but every protocol line
+// goes through linkSendLine, so the rest of the firmware is transport-blind.
 // ---------------------------------------------------------------------------
+void linkSendLine(const char *s) {
+#if defined(BOARD_WROOM32)
+  if (SerialBT.hasClient()) SerialBT.println(s);
+  if (debugMode) Serial.println(s);    // exact line the PC would receive
+#else
+  if (feedWifi) {
+    dataUdp.beginPacket(laptopIp, UDP_PORT);
+    dataUdp.print(s);
+    dataUdp.endPacket();
+  }
+  Serial.println(s);   // USB is the wired feed and doubles as the monitor
+#endif
+}
+
+void linkPrintf(const char *fmt, ...) {
+  char buf[240];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  linkSendLine(buf);
+}
+
 void buildTelemetry(char *buffer, size_t n, const float q[4],
                     const int16_t a[3], const int16_t g[3], int16_t t) {
   // dmp = MPU DMP producing orientation; wf = Wi-Fi video streaming. These let
@@ -213,10 +286,10 @@ void applyServoCommand(char *buf) {
 // GUI's 6-position calibration ("acal:set") or factory trim.
 void recalibrateImu() {
   if (!dmpReady) {
-    SerialBT.println("cal:error,dmp-not-ready");
+    linkSendLine("cal:error,dmp-not-ready");
     return;
   }
-  SerialBT.println("cal:start");
+  linkSendLine("cal:start");
   imuPause = true;
   while (!imuPaused) vTaskDelay(1);    // wait for the IMU task to free the bus
   mpu.setDMPEnabled(false);
@@ -224,8 +297,8 @@ void recalibrateImu() {
   mpu.resetFIFO();
   mpu.setDMPEnabled(true);
   imuPause = false;
-  SerialBT.println("cal:done");
-  Serial.println("Gyro biases recalibrated (BT request)");
+  linkSendLine("cal:done");
+  Serial.println("Gyro biases recalibrated (link request)");
 }
 
 // Apply + persist 6-position accel offsets (BT line "acal:set,<bx>,<by>,<bz>",
@@ -239,21 +312,21 @@ void setAccelCal(char *args) {
     prefs.remove("aov"); prefs.remove("aox"); prefs.remove("aoy"); prefs.remove("aoz");
     prefs.end();
     acalStored = false;
-    SerialBT.println("acal:cleared");
-    Serial.println("6-position accel offsets cleared (BT request)");
+    linkSendLine("acal:cleared");
+    Serial.println("6-position accel offsets cleared (link request)");
     return;
   }
   long b[3];
   if (sscanf(args, "set,%ld,%ld,%ld", &b[0], &b[1], &b[2]) != 3) {
-    SerialBT.println("acal:error,bad-args");
+    linkSendLine("acal:error,bad-args");
     return;
   }
   if (abs(b[0]) > 8000 || abs(b[1]) > 8000 || abs(b[2]) > 8000) {
-    SerialBT.println("acal:error,bias-too-large");
+    linkSendLine("acal:error,bias-too-large");
     return;
   }
   if (!dmpReady) {
-    SerialBT.println("acal:error,dmp-not-ready");
+    linkSendLine("acal:error,dmp-not-ready");
     return;
   }
   imuPause = true;
@@ -278,19 +351,50 @@ void setAccelCal(char *args) {
   prefs.putBool("aov", true);
   prefs.end();
   acalStored = true;
-  SerialBT.printf("acal:ok,%d,%d,%d\n", reg[0], reg[1], reg[2]);
+  linkPrintf("acal:ok,%d,%d,%d", reg[0], reg[1], reg[2]);
   Serial.printf("6-position accel offsets set: %d %d %d (persisted)\n",
                 reg[0], reg[1], reg[2]);
 }
 
-// Active Wi-Fi shutdown (BT line "wifi:off"): stop video and turn the radio off
+// Active Wi-Fi shutdown (line "wifi:off"): stop video and turn the radio off
 // until the next provisioning, instead of leaving the laptop to just ignore it.
+// On the S3 this also kills a Wi-Fi feed, so it drops back to USB first.
 void stopWifiVideo() {
+#if defined(BOARD_S3CAM)
+  feedWifi = false;                    // radio going down takes the feed with it
+  if (cmdUdpUp) { cmdUdp.stop(); cmdUdpUp = false; }
+#endif
   videoState = VID_IDLE;
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  SerialBT.println("wifi:off,ok");
-  Serial.println("Wi-Fi video stopped (BT request)");
+  linkSendLine("wifi:off,ok");
+  Serial.println("Wi-Fi video stopped (link request)");
+}
+
+// S3 only: "feed:wifi" moves the sensor/servo feed onto Wi-Fi UDP (requires
+// provisioned Wi-Fi); "feed:usb" brings it back to the USB serial link. The
+// reply goes out before/after the switch such that both the old and new
+// channel see it (linkSendLine always writes USB too on the S3).
+void setFeedWifi(bool on) {
+#if defined(BOARD_S3CAM)
+  if (on) {
+    if (WiFi.status() != WL_CONNECTED || (uint32_t)laptopIp == 0) {
+      linkSendLine("feed:error,no-wifi");
+      return;
+    }
+    if (!cmdUdpUp) { cmdUdp.begin(CMD_PORT); cmdUdpUp = true; }
+    feedWifi = true;
+    linkSendLine("feed:wifi,ok");
+    Serial.println("Sensor/servo feed -> Wi-Fi UDP");
+  } else {
+    feedWifi = false;
+    linkSendLine("feed:usb,ok");
+    Serial.println("Sensor/servo feed -> USB serial");
+  }
+#else
+  (void)on;
+  linkSendLine("feed:error,unsupported");   // WROOM-32: Bluetooth is the feed
+#endif
 }
 
 // Start (or restart) the Wi-Fi station link for video. args = "ssid|pass|ip".
@@ -299,11 +403,11 @@ void provisionWifi(char *args) {
   char *pass = strtok(NULL, "|");
   char *ips  = strtok(NULL, "|");
   if (!(ssid && pass && ips)) {
-    SerialBT.println("wifi:error,bad-args");
+    linkSendLine("wifi:error,bad-args");
     return;
   }
   if (!laptopIp.fromString(ips)) {
-    SerialBT.println("wifi:error,bad-ip");
+    linkSendLine("wifi:error,bad-ip");
     return;
   }
   wifiSsid = ssid;
@@ -312,13 +416,13 @@ void provisionWifi(char *args) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   videoState = VID_CONNECTING;
-  SerialBT.printf("wifi:connecting,%s\n", wifiSsid.c_str());
+  linkPrintf("wifi:connecting,%s", wifiSsid.c_str());
   Serial.printf("Provisioned Wi-Fi '%s', video -> %s:%d\n", wifiSsid.c_str(), ips, VIDEO_PORT);
 }
 
-void handleBtLine(char *line) {
+void handleLine(char *line) {
   if (strcmp(line, "id?") == 0) {
-    SerialBT.printf("id:lifeos,proto:1,servos:%d\n", NUM_SERVOS);
+    linkPrintf("id:lifeos,proto:1,servos:%d,board:%s", NUM_SERVOS, BOARD_NAME);
   } else if (strcmp(line, "cal") == 0) {
     recalibrateImu();
   } else if (strncmp(line, "acal:", 5) == 0) {
@@ -327,32 +431,68 @@ void handleBtLine(char *line) {
     stopWifiVideo();
   } else if (strncmp(line, "wifi:", 5) == 0) {
     provisionWifi(line + 5);
+  } else if (strcmp(line, "feed:wifi") == 0) {
+    setFeedWifi(true);
+  } else if (strcmp(line, "feed:usb") == 0) {
+    setFeedWifi(false);
+  } else if (strcmp(line, "debug") == 0) {
+    setDebugMode(!debugMode);
   } else {
     applyServoCommand(line);
   }
 }
 
-// Accumulate incoming Bluetooth bytes into lines and dispatch each.
-void btPoll() {
+// Accumulate incoming feed bytes into lines and dispatch each. On the
+// WROOM-32 the feed is Bluetooth; on the S3 it's USB serial plus -- once
+// "feed:wifi" is active -- UDP command datagrams on CMD_PORT ("hello"
+// re-teaches our peer IP, everything else is a normal control line).
+void feedPoll() {
   static char line[200];
   static size_t idx = 0;
+#if defined(BOARD_WROOM32)
   while (SerialBT.available()) {
     char c = (char)SerialBT.read();
     if (c == '\n' || c == '\r') {
-      if (idx > 0) { line[idx] = '\0'; handleBtLine(line); idx = 0; }
+      if (idx > 0) { line[idx] = '\0'; handleLine(line); idx = 0; }
     } else if (idx < sizeof(line) - 1) {
       line[idx++] = c;
     }
   }
+#else
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (idx > 0) { line[idx] = '\0'; handleLine(line); idx = 0; }
+    } else if (idx < sizeof(line) - 1) {
+      line[idx++] = c;
+    }
+  }
+  if (cmdUdpUp) {
+    while (cmdUdp.parsePacket() > 0) {
+      char pkt[200];
+      int len = cmdUdp.read(pkt, sizeof(pkt) - 1);
+      if (len <= 0) continue;
+      pkt[len] = '\0';
+      while (len > 0 && (pkt[len - 1] == '\n' || pkt[len - 1] == '\r')) pkt[--len] = '\0';
+      if (len == 0) continue;
+      if (strcmp(pkt, "hello") == 0) {   // gui.py WifiLink.register_peer()
+        laptopIp = cmdUdp.remoteIP();
+        continue;
+      }
+      handleLine(pkt);
+    }
+  }
+#endif
 }
 
-void btSendSensor(const float q[4], const int16_t a[3], const int16_t g[3],
-                  int16_t t) {
-  if (!SerialBT.hasClient() && !debugMode) return;
+void sendSensor(const float q[4], const int16_t a[3], const int16_t g[3],
+                int16_t t) {
+#if defined(BOARD_WROOM32)
+  if (!SerialBT.hasClient() && !debugMode) return;   // nobody listening
+#endif
   char buffer[200];
   buildTelemetry(buffer, sizeof(buffer), q, a, g, t);
-  if (SerialBT.hasClient()) SerialBT.println(buffer);
-  if (debugMode) Serial.println(buffer);   // exact line the PC would receive
+  linkSendLine(buffer);
 }
 
 // --- USB-serial debug console: "debug" toggles echoing everything the ESP32
@@ -375,10 +515,17 @@ void setDebugMode(bool on) {
   Serial.printf("dbg: telemetry echo %s\n", on ? "ON" : "OFF");
   if (!on) return;
   prefs.begin("lifeos", false);
+#if defined(BOARD_WROOM32)
   Serial.printf("dbg: acal stored=%d ox=%d oy=%d oz=%d | bt client=%d\n",
                 prefs.getBool("aov", false) ? 1 : 0,
                 prefs.getShort("aox", 0), prefs.getShort("aoy", 0),
                 prefs.getShort("aoz", 0), SerialBT.hasClient() ? 1 : 0);
+#else
+  Serial.printf("dbg: acal stored=%d ox=%d oy=%d oz=%d | feed=%s\n",
+                prefs.getBool("aov", false) ? 1 : 0,
+                prefs.getShort("aox", 0), prefs.getShort("aoy", 0),
+                prefs.getShort("aoz", 0), feedWifi ? "wifi" : "usb");
+#endif
   prefs.end();
   if (dmpReady) {                      // grab the bus safely for the dump
     imuPause = true;
@@ -401,6 +548,10 @@ void debugVideoTick() {
   lastSeq = videoSeq;
 }
 
+#if defined(BOARD_WROOM32)
+// WROOM-32 only: USB serial is purely a monitor there, so it accepts just the
+// "debug" toggle. (On the S3 the USB serial IS the feed -- feedPoll() reads it
+// and "debug" is a normal control line via handleLine().)
 void usbPoll() {
   static char line[64];
   static size_t idx = 0;
@@ -418,6 +569,7 @@ void usbPoll() {
     }
   }
 }
+#endif
 
 
 // ---------------------------------------------------------------------------
@@ -440,7 +592,7 @@ void updateWifiVideo() {
   if (videoState == VID_CONNECTING) {
     if (WiFi.status() == WL_CONNECTED) {
       videoState = VID_STREAMING;
-      SerialBT.printf("wifi:connected,%s\n", WiFi.localIP().toString().c_str());
+      linkPrintf("wifi:connected,%s", WiFi.localIP().toString().c_str());
       Serial.print("Wi-Fi connected as "); Serial.print(WiFi.localIP());
       Serial.print(", streaming video to "); Serial.println(laptopIp);
     }
@@ -457,7 +609,10 @@ void updateWifiVideo() {
 
 
 void setup() {
-  Wire.begin();
+  // Explicit I2C pins: the S3's Arduino defaults (SDA 8 / SCL 9) are camera
+  // data pins on the S3-CAM, so relying on Wire.begin() there would fight the
+  // camera bus. Explicit on both boards for symmetry.
+  Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
   Serial.begin(115200);
 
@@ -503,16 +658,23 @@ void setup() {
     Serial.print("DMP init failed, code "); Serial.println(devStatus);
   }
 
+#if defined(BOARD_WROOM32)
   SerialBT.begin(BT_NAME);
   Serial.printf("Bluetooth SPP up as \"%s\"; provision Wi-Fi/video over it.\n", BT_NAME);
+#else
+  Serial.println("USB serial feed up (board s3cam); provision Wi-Fi over it, "
+                 "then 'feed:wifi' to go wireless.");
+#endif
 
   xTaskCreatePinnedToCore(imuTask, "imuTask", 4096, NULL, 3, &imuTaskHandle, 0);
 }
 
 
 void loop() {
-  btPoll();              // sensor commands + Wi-Fi provisioning
+  feedPoll();            // sensor commands + Wi-Fi provisioning (BT/USB/UDP)
+#if defined(BOARD_WROOM32)
   usbPoll();             // USB serial monitor: "debug" toggle
+#endif
   updateWifiVideo();     // Wi-Fi connect state machine + video frames
   if (debugMode) debugVideoTick();
 
@@ -535,5 +697,5 @@ void loop() {
   if (seq == lastSentSeq) return;
   lastSentSeq = seq;
 
-  btSendSensor(q, a, g, t);
+  sendSensor(q, a, g, t);
 }
