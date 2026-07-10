@@ -22,9 +22,9 @@ supported** — a compile-time `#define` at the top of `lifeOs.ino`
 On either board, **Wi-Fi station (on demand)** carries high-bandwidth **video**
 over UDP: brought up only after the laptop sends Wi-Fi credentials + its own
 current IP over the feed link, so a changing laptop DHCP address is handled
-every session and nothing is hardcoded. (Real camera is future work — the
-S3-CAM's OV3660 is the intended source; a synthetic frame stream tests the
-path today.)
+every session and nothing is hardcoded. On the S3-CAM the OV3660 streams real
+JPEG frames (chunked `vf:` packets); the synthetic `vid:` stream remains the
+fallback (WROOM-32 always; S3 if camera init fails).
 
 Files:
 - `lifeOs.ino` — firmware (MPU6050 DMP + servos + BT sensor link + Wi-Fi video).
@@ -32,6 +32,8 @@ Files:
   visualizer), **Servos**, **Hand Model** tabs, plus a bottom-left status bar.
 - `CleanInput.py`, `live_charts.py` — packet cleaning / unit conversion + the
   per-sensor `Sparkline` widgets used in the Monitor table.
+- `session_log.py` — per-run log file (see **Logging** below); `log/` holds the
+  output, one dated folder per day (gitignored).
 - `web/` — vendored three.js scene for the Monitor tab's 3D view.
 - `reciever.py` — legacy terminal receiver (old Wi-Fi/UDP sensor mode).
 - `bt_receiver.py` — terminal receiver for the Bluetooth sensor link.
@@ -109,7 +111,14 @@ them per prefix for `Link.control()`.
   (handled as a normal control line; on the WROOM-32 also accepted directly on
   the USB monitor).
 
-**Video (Wi-Fi UDP → port 5010):** synthetic `vid:<seq>:`-prefixed 1 KB packets.
+**Video (Wi-Fi UDP → port 5010):** on the S3-CAM, OV3660 JPEG frames (VGA,
+quality 12, ~10 fps, sensor-compressed) as chunks
+`vf:<frame_id>:<chunk_idx>/<chunk_count>:<binary JPEG bytes>` (~1200-byte
+payloads); the receiver reassembles by frame id, latest frame wins, incomplete
+frames dropped (designDecisions §18). Camera init failure → `cam:error,<code>`
+once + fallback to the synthetic `vid:<seq>:`-prefixed 1 KB packets (which the
+camera-less WROOM-32 always sends); success replies `cam:ok`. Camera pins are
+the stock ESP32S3-EYE map.
 
 ## GUI
 
@@ -165,10 +174,13 @@ them per prefix for `Link.control()`.
     (swing-twist), keeping gravity-true roll/pitch.
   - Servos tab has a per-servo **Enabled/Disabled** toggle (`e<i>:0/1`, detach =
     limp) next to the slider; dial labels show "(off)" from the echoed `e*`.
-- **Hand Model tab** — dropdown of the PC's video input devices (via
-  QtMultimedia `QMediaDevices`); Apply streams the selected camera into a small
-  preview box (`QCamera` → `QMediaCaptureSession` → `QVideoWidget`). Planned:
-  the ESP32's Wi-Fi UDP video as another selectable source, then hand tracking.
+- **Hand Model tab** — source dropdown: **"ESP32 camera (Wi-Fi UDP :5010)"**
+  (always row 0; `VideoReceiver` reassembles the `vf:` JPEG chunks and a QLabel
+  paints the latest frame at ≤15 Hz, with an fps/KB status line that also says
+  when only the synthetic stream is arriving) plus the PC's video input devices
+  (QtMultimedia `QMediaDevices`; Apply streams the picked camera via `QCamera`
+  → `QMediaCaptureSession` → `QVideoWidget`). The ESP32 source works without
+  QtMultimedia. Planned: hand tracking on the selected source.
 - **Status bar (bottom-left)** — colored `StatusDot` boxes (BT blue, Wi-Fi green,
   Servo1/Servo2 red, MPU yellow) showing ✓/✗ by whether that source had a live
   signal in the last second (all derived from the fresh BT telemetry line).
@@ -176,6 +188,35 @@ them per prefix for `Link.control()`.
   visible); "restore down" always lands on `RESTORED_SIZE` clamped to the
   current monitor and centered (`changeEvent` override), never Qt's remembered
   geometry — guards against the off-screen-title-bar glitch.
+
+## Logging (read this first when a value misbehaves)
+
+Every GUI run writes `log/<YYYY-MM-DD>/log-<YYYY-MM-DD>_<HH-MM-SS>.txt`
+(`session_log.py`, gitignored). It is the artifact to read instead of asking the
+user to reproduce a bug live — the serial-monitor panel hides telemetry, holds
+only 2000 lines, and stops draining while hidden.
+
+Format `HH:MM:SS.mmm  TAG  VIA  payload`, chronological, one line per event:
+
+| Tag | Meaning |
+| --- | --- |
+| `RX` | telemetry accepted by `_ingest` (verbatim, so `parse_line()` reads it back) |
+| `CTL` | control reply (`cal:`, `acal:`, `wifi:`, `id:`, `feed:`) |
+| `RAW` | other board output (boot banner, `cam_hal:` prints) |
+| `DROP` | line **rejected** by `_ingest`, with the failing check: `fragment` (missing keys) / `bad-quat` / `bad-counts` |
+| `TX` | line sent to the board (Wi-Fi password redacted; `<< SEND FAILED` / `<< no link` on failure) |
+| `PC` | GUI event: button press, link swap, zero locked in, flips changed |
+| `STATE` | 1 Hz visualizer de-drift internals (`rpy`, `yaw_off`, `drift`, `still`, `glitches`) + a line whenever the glitch guard trips |
+| `VID` | 1 Hz video health (size, fps, KB/frame, frames abandoned mid-reassembly) |
+| `OUT` / `ERR` | stdout / stderr, uncaught tracebacks (any thread), Qt messages |
+
+The header records the git SHA, board, baud, laptop IP, `connect_config.json`
+(password redacted) and `calibration.json` — a wrong zero or stale scale factor
+looks exactly like a bad sensor otherwise. The footer gives per-tag counts and
+the drop rate. Logging is hooked at the **source** (`Link._ingest`,
+`Link.send_line`, `ConnectionManager.set_active`, `ui_log`), never at the panel;
+`session_log.log()` is a no-op until `start()` (called from `main()`), so
+`smoke_gui.py` writes nothing. designDecisions §21.
 
 ## Code structure (gui.py)
 
@@ -223,6 +264,10 @@ SDA/SCL/VCC/GND, confirm AD0→GND).
 
 ## Build / run
 
+**The ESP32-S3-CAM is the only actively developed board** (user decision
+2026-07-08): do not modify or compile-verify the `BOARD_WROOM32` variant
+anymore — its code stays as frozen legacy. Keep `#define BOARD_S3CAM` active.
+
 **Firmware:** pick the board at the top of `lifeOs.ino` (`#define BOARD_S3CAM`
 or `BOARD_WROOM32`), then Arduino IDE / arduino-cli with the ESP32 board
 package. Libraries: "MPU6050" by Electronic Cats + "ESP32Servo" (WiFi/WiFiUdp/
@@ -234,7 +279,8 @@ BluetoothSerial ship with the core). Board settings:
   (`esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi`); the default 16 MB partition
   fits (no BT Classic stack). Flash/monitor via the **COM** USB-C port
   (CH343).
-Serial at 115200; keep the sensor still ~2 s on boot (DMP calibration).
+Serial at **921600** (`SERIAL_BAUD` in gui.py must match `Serial.begin` in the
+firmware); keep the sensor still ~2 s on boot (DMP calibration).
 
 **PC:**
 ```

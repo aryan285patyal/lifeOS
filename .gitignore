@@ -25,3 +25,6 @@ connect_config.json
 
 # Per-device 6-position accel calibration (scale factors; bias lives on the ESP32)
 calibration.json
+
+# Session logs -- one file per GUI run (machine-specific, large, carries the SSID)
+log/

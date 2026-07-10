@@ -14,8 +14,10 @@
 // Either way, WI-FI (station, on demand) carries high-bandwidth VIDEO over
 // UDP (port 5010). It is brought up only after the laptop sends Wi-Fi
 // credentials + its own IP over the feed link, so a changing laptop DHCP
-// address is handled every session and nothing is hardcoded. (Real camera is
-// future work; for now a synthetic frame stream tests the Wi-Fi path.)
+// address is handled every session and nothing is hardcoded. On the S3-CAM
+// the OV3660 streams real JPEG frames as "vf:<frame>:<idx>/<count>:<bytes>"
+// chunks (camera init failure falls back to the synthetic "vid:" stream,
+// which is also what the camera-less WROOM-32 always sends).
 //
 // Control lines (over the active feed link):
 //   wifi:<ssid>|<password>|<laptop_ip>   provision Wi-Fi -> wifi:connected,<ip>
@@ -34,8 +36,9 @@
 //   debug                                toggle telemetry echo + 1 Hz status on
 //                                        the USB serial monitor
 //
-// Concurrency: an IMU task on core 0 drains the DMP FIFO (INT pin interrupt);
-// loop() on core 1 runs the feed link + the Wi-Fi video sender.
+// Concurrency: core 0 belongs to the prebuilt SDK's pinned heavies (Wi-Fi
+// stack task + the camera driver's cam_task); our IMU task lives on core 1
+// at priority 3, preempting loop() (feed link + video sender) as needed.
 //
 // Libraries: "MPU6050" by Electronic Cats, "ESP32Servo". WiFi/WiFiUdp (and
 // BluetoothSerial on the WROOM-32) ship with the ESP32 core.
@@ -69,7 +72,9 @@
 const long   interval      = 20;     // sensor TX period, ms (50 Hz)
 const int    VIDEO_PORT    = 5010;   // laptop receives video UDP here
 const size_t VIDEO_PKT     = 1024;   // synthetic video packet size, bytes
-const long   videoInterval = 20;     // video frame period, ms
+const long   videoInterval = 20;     // synthetic packet period, ms
+const size_t VIDEO_CHUNK   = 1200;   // camera JPEG chunk payload, bytes (< MTU)
+const long   camInterval   = 100;    // camera frame period, ms (~10 fps)
 
 // --- Pins + servo count per board. Signal wire only; power servos from a
 // separate 5-6V supply sharing ground with the ESP32. ---
@@ -128,6 +133,34 @@ VideoState    videoState    = VID_IDLE;
 unsigned long lastVideoTime = 0;
 uint32_t      videoSeq      = 0;
 
+#if defined(BOARD_S3CAM)
+// --- OV3660 camera (S3-CAM only). GOOUUU's wiring equals the standard
+// CAMERA_MODEL_ESP32S3_EYE map; frames are captured as JPEG straight from
+// the sensor and sent to laptop:VIDEO_PORT as "vf:" chunks. If the camera
+// fails to init, the synthetic "vid:" stream keeps the path testable. ---
+#include "esp_camera.h"
+#define CAM_PIN_PWDN  -1
+#define CAM_PIN_RESET -1
+#define CAM_PIN_XCLK  15
+#define CAM_PIN_SIOD  4
+#define CAM_PIN_SIOC  5
+#define CAM_PIN_D7    16
+#define CAM_PIN_D6    17
+#define CAM_PIN_D5    18
+#define CAM_PIN_D4    12
+#define CAM_PIN_D3    10
+#define CAM_PIN_D2    8
+#define CAM_PIN_D1    9
+#define CAM_PIN_D0    11
+#define CAM_PIN_VSYNC 6
+#define CAM_PIN_HREF  7
+#define CAM_PIN_PCLK  13
+bool     camTried     = false;       // init attempted (once, on first stream)
+bool     camReady     = false;       // init succeeded -> vf: chunks, not vid:
+uint32_t camFrameId   = 0;           // frame counter in the vf: header
+size_t   camLastBytes = 0;           // last JPEG size, for the debug status
+#endif
+
 // --- DMP state (touched only by setup + the IMU task) ---
 volatile bool dmpReady = false;      // also cleared by recalibrateImu() on core 1
 uint8_t  devStatus;
@@ -136,6 +169,10 @@ uint8_t  fifoBuffer[64];
 
 volatile bool mpuInterrupt = false;
 void IRAM_ATTR dmpDataReady() { mpuInterrupt = true; }
+
+// Packets whose quaternion wasn't unit-norm, i.e. the FIFO read was out of
+// packet alignment (see imuTask). Reported on the debug monitor.
+volatile uint32_t dmpResyncs = 0;
 
 // Recalibration handshake: loop() (core 1) must not touch the I2C bus while the
 // IMU task (core 0) is mid-read, so it raises imuPause and waits for the task
@@ -177,35 +214,44 @@ void imuTask(void *param) {
     }
     mpuInterrupt = false;
 
-    uint8_t  intStatus = mpu.getIntStatus();
-    uint16_t fifoCount = mpu.getFIFOCount();
-
-    if ((intStatus & 0x10) || fifoCount >= 1024) {   // FIFO overflow -> resync
-      mpu.resetFIFO();
+    // Overflow-proof read: drains any backlog and hands back the *newest*
+    // packet (resetting the FIFO when it has run away). The hand-rolled
+    // getFIFOCount/getFIFOBytes pair this replaces could leave the read phase
+    // shifted inside a packet - a truncated packet on overflow, or a short
+    // I2C read under camera/Wi-Fi load - and nothing ever resynced it, so
+    // every later quaternion was two half-packets glued together.
+    if (!mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+      vTaskDelay(1);
       continue;
     }
 
-    if (intStatus & 0x02) {
-      while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-      mpu.getFIFOBytes(fifoBuffer, packetSize);
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
 
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      // Accel/gyro come from the sensor's data registers, NOT the DMP FIFO:
-      // the FIFO "accel" is a DMP-internal filtered quantity that only equals
-      // gravity when flat and collapses toward zero when rotated (measured
-      // ~0.03g total while inverted) -- useless as raw counts. The registers
-      // hold the true raw measurements at the DMP's FSRs (+/-2g, +/-2000dps).
-      mpu.getMotion6(&rawA[0], &rawA[1], &rawA[2], &rawG[0], &rawG[1], &rawG[2]);
-      int16_t temp = mpu.getTemperature();   // not in the FIFO; separate register
-
-      portENTER_CRITICAL(&stateMux);
-      sQ[0] = q.w; sQ[1] = q.x; sQ[2] = q.y; sQ[3] = q.z;
-      sAccel[0] = rawA[0]; sAccel[1] = rawA[1]; sAccel[2] = rawA[2];
-      sGyro[0] = rawG[0]; sGyro[1] = rawG[1]; sGyro[2] = rawG[2];
-      sTemp = temp;
-      sSeq++;
-      portEXIT_CRITICAL(&stateMux);
+    // The DMP only ever emits unit quaternions, so anything else means the
+    // packet was misaligned. Resetting the FIFO restores the phase; without
+    // this the corruption is permanent (a shifted stream never overflows).
+    float n2 = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (n2 < 0.96f || n2 > 1.04f) {
+      mpu.resetFIFO();
+      dmpResyncs++;
+      continue;
     }
+
+    // Accel/gyro come from the sensor's data registers, NOT the DMP FIFO:
+    // the FIFO "accel" is a DMP-internal filtered quantity that only equals
+    // gravity when flat and collapses toward zero when rotated (measured
+    // ~0.03g total while inverted) -- useless as raw counts. The registers
+    // hold the true raw measurements at the DMP's FSRs (+/-2g, +/-2000dps).
+    mpu.getMotion6(&rawA[0], &rawA[1], &rawA[2], &rawG[0], &rawG[1], &rawG[2]);
+    int16_t temp = mpu.getTemperature();     // not in the FIFO; separate register
+
+    portENTER_CRITICAL(&stateMux);
+    sQ[0] = q.w; sQ[1] = q.x; sQ[2] = q.y; sQ[3] = q.z;
+    sAccel[0] = rawA[0]; sAccel[1] = rawA[1]; sAccel[2] = rawA[2];
+    sGyro[0] = rawG[0]; sGyro[1] = rawG[1]; sGyro[2] = rawG[2];
+    sTemp = temp;
+    sSeq++;
+    portEXIT_CRITICAL(&stateMux);
   }
 }
 
@@ -544,6 +590,17 @@ void debugVideoTick() {
   if (now - lastPrint < 1000) return;
   const char *st = (videoState == VID_STREAMING)  ? "streaming" :
                    (videoState == VID_CONNECTING) ? "connecting" : "idle";
+#if defined(BOARD_S3CAM)
+  static uint32_t lastFrame = 0;
+  if (camReady) {
+    Serial.printf("dbg cam: state=%s fps=%u last=%uB rssi=%d resync=%u -> %s:%d\n",
+                  st, camFrameId - lastFrame, (unsigned)camLastBytes, wifiRssi,
+                  (unsigned)dmpResyncs, laptopIp.toString().c_str(), VIDEO_PORT);
+    lastPrint = now;
+    lastFrame = camFrameId;
+    return;
+  }
+#endif
   Serial.printf("dbg wifi: state=%s pkts/s=%u rssi=%d -> %s:%d\n",
                 st, videoSeq - lastSeq, wifiRssi,
                 laptopIp.toString().c_str(), VIDEO_PORT);
@@ -576,9 +633,11 @@ void usbPoll() {
 
 
 // ---------------------------------------------------------------------------
-// Wi-Fi video: synthetic frame stream to the provisioned laptop IP.
-// Each packet: "vid:<seq>:" header padded with filler to VIDEO_PKT bytes, so
-// the PC-side test can measure throughput and detect loss via the sequence.
+// Wi-Fi video to the provisioned laptop IP. S3-CAM: OV3660 JPEG frames as
+// "vf:<frame>:<idx>/<count>:<jpeg-bytes>" chunks (~VIDEO_CHUNK payload each;
+// the PC reassembles, latest frame wins). Synthetic "vid:<seq>:" filler
+// packets remain the fallback (WROOM-32 always; S3 when camera init fails)
+// so the transport stays testable without a working sensor.
 // ---------------------------------------------------------------------------
 void sendVideoFrame() {
   static uint8_t buf[VIDEO_PKT];
@@ -591,6 +650,83 @@ void sendVideoFrame() {
   videoSeq++;
 }
 
+#if defined(BOARD_S3CAM)
+void cameraInit() {
+  camTried = true;
+  camera_config_t cfg = {};
+  cfg.pin_pwdn     = CAM_PIN_PWDN;
+  cfg.pin_reset    = CAM_PIN_RESET;
+  cfg.pin_xclk     = CAM_PIN_XCLK;
+  cfg.pin_sccb_sda = CAM_PIN_SIOD;
+  cfg.pin_sccb_scl = CAM_PIN_SIOC;
+  cfg.pin_d7 = CAM_PIN_D7;  cfg.pin_d6 = CAM_PIN_D6;
+  cfg.pin_d5 = CAM_PIN_D5;  cfg.pin_d4 = CAM_PIN_D4;
+  cfg.pin_d3 = CAM_PIN_D3;  cfg.pin_d2 = CAM_PIN_D2;
+  cfg.pin_d1 = CAM_PIN_D1;  cfg.pin_d0 = CAM_PIN_D0;
+  cfg.pin_vsync = CAM_PIN_VSYNC;
+  cfg.pin_href  = CAM_PIN_HREF;
+  cfg.pin_pclk  = CAM_PIN_PCLK;
+  cfg.xclk_freq_hz = 10000000;         // ~sensor 10-12 fps: matches our send
+                                       // rate (camInterval) so FB-OVF stays
+                                       // quiet and core 0 keeps headroom
+  cfg.ledc_timer   = LEDC_TIMER_2;     // away from the servos' LEDC channels
+  cfg.ledc_channel = LEDC_CHANNEL_6;   // (ESP32Servo assigns from 0 upward)
+  cfg.pixel_format = PIXFORMAT_JPEG;   // OV3660 compresses on-sensor
+  cfg.frame_size   = FRAMESIZE_VGA;    // 640x480; raise once the path is solid
+  cfg.jpeg_quality = 12;               // 0-63, lower = better/larger
+  cfg.fb_count     = 2;
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  if (!psramFound()) {
+    // PSRAM absent: either not enabled at flash time (Arduino IDE: Tools >
+    // PSRAM must be "OPI PSRAM" on this board) or genuinely missing. A QVGA
+    // JPEG frame fits internal RAM, so bring the camera up smaller instead
+    // of failing ("frame buffer malloc failed").
+    Serial.println("No PSRAM detected - QVGA frame buffer in internal RAM "
+                   "(flash with PSRAM=OPI PSRAM to get VGA)");
+    cfg.frame_size  = FRAMESIZE_QVGA;
+    cfg.fb_count    = 1;
+    cfg.fb_location = CAMERA_FB_IN_DRAM;
+  }
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    linkPrintf("cam:error,0x%x", err);
+    Serial.printf("Camera init failed (0x%x), psram=%d, free heap=%u - "
+                  "falling back to the synthetic stream\n",
+                  err, psramFound() ? 1 : 0, (unsigned)ESP.getFreeHeap());
+    return;
+  }
+  camReady = true;
+  // The cam driver's runtime warnings (FB-OVF frame drops) print from
+  // cam_task on core 0 and interleave mid-line with telemetry on the shared
+  // USB serial, corrupting the feed - drop them now that init succeeded.
+  esp_log_level_set("cam_hal", ESP_LOG_NONE);
+  linkSendLine("cam:ok");
+  Serial.printf("OV3660 camera up: %s JPEG -> vf: chunks\n",
+                psramFound() ? "VGA" : "QVGA (no PSRAM)");
+}
+
+void sendCameraFrame() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;                     // transient: skip this tick
+  camLastBytes = fb->len;
+  uint32_t chunks = (fb->len + VIDEO_CHUNK - 1) / VIDEO_CHUNK;
+  for (uint32_t i = 0; i < chunks; i++) {
+    size_t off  = (size_t)i * VIDEO_CHUNK;
+    size_t take = fb->len - off < VIDEO_CHUNK ? fb->len - off : VIDEO_CHUNK;
+    char hdr[40];
+    int  hn = snprintf(hdr, sizeof(hdr), "vf:%u:%u/%u:", camFrameId, i, chunks);
+    videoUdp.beginPacket(laptopIp, VIDEO_PORT);
+    videoUdp.write((const uint8_t *)hdr, hn);
+    videoUdp.write(fb->buf + off, take);
+    videoUdp.endPacket();
+    if ((i & 7) == 7) vTaskDelay(1);   // breathe: Wi-Fi TX queue + telemetry
+  }
+  esp_camera_fb_return(fb);
+  camFrameId++;
+}
+#endif
+
 void updateWifiVideo() {
   if (videoState == VID_CONNECTING) {
     if (WiFi.status() == WL_CONNECTED) {
@@ -598,11 +734,23 @@ void updateWifiVideo() {
       linkPrintf("wifi:connected,%s", WiFi.localIP().toString().c_str());
       Serial.print("Wi-Fi connected as "); Serial.print(WiFi.localIP());
       Serial.print(", streaming video to "); Serial.println(laptopIp);
+#if defined(BOARD_S3CAM)
+      if (!camTried) cameraInit();     // once; failure -> synthetic fallback
+#endif
     }
     return;
   }
   if (videoState == VID_STREAMING) {
     unsigned long now = millis();
+#if defined(BOARD_S3CAM)
+    if (camReady) {
+      if (now - lastVideoTime >= camInterval) {
+        lastVideoTime = now;
+        sendCameraFrame();
+      }
+      return;
+    }
+#endif
     if (now - lastVideoTime >= videoInterval) {
       lastVideoTime = now;
       sendVideoFrame();
@@ -617,7 +765,9 @@ void setup() {
   // camera bus. Explicit on both boards for symmetry.
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
-  Serial.begin(115200);
+  // 921600 (matches SERIAL_BAUD in gui.py): at 115200 the 50 Hz telemetry
+  // filled ~65% of the line, so any concurrent print tore lines mid-packet.
+  Serial.begin(921600);
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -669,7 +819,12 @@ void setup() {
                  "then 'feed:wifi' to go wireless.");
 #endif
 
-  xTaskCreatePinnedToCore(imuTask, "imuTask", 4096, NULL, 3, &imuTaskHandle, 0);
+  // Core 1, not 0: the prebuilt Arduino SDK pins both the Wi-Fi stack task
+  // and the camera driver's near-max-priority cam_task to core 0
+  // (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0, CONFIG_CAMERA_CORE0) - the IMU
+  // task starved there the moment frames flowed. On core 1 it shares with
+  // loop() but outranks it (prio 3 vs 1), so FIFO reads preempt the senders.
+  xTaskCreatePinnedToCore(imuTask, "imuTask", 4096, NULL, 3, &imuTaskHandle, 1);
 }
 
 

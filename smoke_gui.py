@@ -21,6 +21,9 @@ class FakeListener:
 
 
 app = QApplication(sys.argv)
+# Ignore this machine's saved calibration: its value_flips would negate the
+# roll/pitch rows the assertions below check.
+gui.load_calibration = lambda: {}
 win = gui.MonitorWindow(FakeListener())
 
 # Rows are interleaved per axis: ax, gx, ay, gy, az, gz, temp.

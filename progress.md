@@ -326,3 +326,139 @@ designDecisions.md, and to-do.md.
 - **Why:** Resolves the open antenna question with a measurement; the rework
   only matters for range/enclosure use, so it is production backlog.
 - **Pushed:** yes (0ddd169)
+
+## 2026-07-08 — Real camera video: OV3660 JPEG over UDP + live GUI preview
+- **What:** S3-CAM firmware captures OV3660 JPEG (VGA, quality 12, ~10 fps,
+  PSRAM frame buffers, lazy init on first stream; ESP32S3-EYE pin map) and
+  sends `vf:<frame>:<idx>/<count>:<bytes>` chunks (~1200 B) to laptop:5010;
+  `cam:ok`/`cam:error,<code>` reply, synthetic `vid:` fallback kept (and
+  WROOM-32 unchanged). GUI: new `VideoReceiver` (latest-wins reassembly,
+  loopback-tested byte-exact with simulated loss) and the Hand Model tab now
+  has "ESP32 camera (Wi-Fi UDP :5010)" as its first source with a live
+  preview + fps/KB status; works without QtMultimedia. wifi_video_test.py
+  understands both stream kinds and gained --save. Both firmware variants
+  compile (S3 77%). Live check: synthetic stream measured at 50 pkt/s, 0%
+  loss now that laptop and ESP share the Wi-Fi (fixes.md §1 workaround).
+- **Why:** The whole Wi-Fi path existed to carry real video; this makes the
+  camera the payload and gives the Hand Model tab its intended source.
+  designDecisions §18.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Camera init: PSRAM detection + QVGA-in-DRAM fallback
+- **What:** First flash hit "cam_dma_config: frame buffer malloc failed" -
+  the build was flashed without PSRAM enabled, so the VGA frame buffers had
+  nowhere to live. cameraInit() now checks psramFound(): without PSRAM it
+  retries with QVGA, fb_count 1, CAMERA_FB_IN_DRAM (fits internal RAM), and
+  the error path logs psram state + free heap. Boot log says which mode came
+  up. Real fix for full VGA: flash with Tools > PSRAM > "OPI PSRAM"
+  (arduino-cli FQBN ...:FlashSize=16M,PSRAM=opi).
+- **Why:** The camera should degrade to a smaller frame, not die, when the
+  flash settings are wrong - and the log should say why.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Camera/MPU core contention fixed; S3 flashed
+- **What:** With the camera live, cam_hal FB-OVF spam appeared and the MPU
+  went silent: the SDK pins the near-max-priority cam_task AND the Wi-Fi
+  stack to core 0, where our priority-3 IMU task starved. IMU task moved to
+  core 1 (outranks loop()); camera XCLK 20 -> 10 MHz (sensor fps ~= our
+  10 fps send rate, FB-OVF quieted); camera LEDC moved to timer 2/channel 6
+  (was clobbering servo 0's channel 0). designDecisions 19 (supersedes the
+  core numbers in 2). Both variants compile; S3 flashed over COM7
+  (esptool confirmed 8 MB embedded PSRAM).
+- **Why:** Camera and MPU must run simultaneously - the camera's core
+  pinning is baked into the prebuilt SDK, so our task is the one that moves.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Visualizer/relative-table jumps: spliced telemetry lines fixed
+- **What:** With the camera live, the 3D view and the relative-state table
+  jumped between huge +/- values while the raw table stayed stable. Cause:
+  the cam driver's FB-OVF warnings print from cam_task (core 0) and
+  interleave mid-line with telemetry (loop, core 1) on the shared USB
+  serial; a fragment cut at a comma boundary still parses as valid key:vals
+  and wholesale-replaced Link.latest, so quaternion consumers read missing
+  q* keys as zero. Two-sided fix: firmware silences the cam_hal log tag once
+  the camera is up (the warnings are just frame-drop notices), and
+  Link._ingest now accepts a line as telemetry only if it carries the full
+  q0..q3 + ax..gz set (TELEMETRY_KEYS) - fragments can never displace the
+  last good sample. S3 re-flashed (COM7).
+- **Why:** Two independent writers on one serial line will always interleave
+  eventually; the GUI must be robust to torn lines regardless of firmware
+  politeness.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-08 — Visualizer freakouts + post-unplug yawing fixed; 921600 baud; S3-only
+- **What:** Three-layer fix for the remaining orientation glitches:
+  (1) Link._ingest now also validates values (unit-norm quaternion,
+  int16-range counts) - torn lines that still parse (e.g. "q0:09948" after
+  losing a dot) are rejected; (2) the yaw de-drift ignores >45 deg/tick
+  steps, gates rate-learning at 5 deg/s, clamps the learned rate at 2 deg/s,
+  and _tick freezes with state reset while disconnected (a stale snapshot
+  used to keep integrating drift -> endless yawing after unplug); (3) feed
+  serial raised 115200 -> 921600 on both sides (SERIAL_BAUD) so telemetry
+  drops from ~65% to ~8% line utilization. CLAUDE.md now records the user's
+  S3-only decision (WROOM-32 frozen legacy, no more changes/compile checks).
+  GUI + S3 firmware compile; flash pending (board was unplugged).
+- **Why:** A single corrupt sample poisoned the de-drift integrator and EMA,
+  so the view misbehaved long after good data resumed; disconnect exposed
+  the open-loop drift integration.
+- **Pushed:** no (uncommitted)
+
+## 2026-07-09 17:20 — Per-run session log (`log/<date>/log-<date>_<time>.txt`)
+- **What:** New `session_log.py`: every GUI run opens its own timestamped log
+  file under `log/<date>/` and records, chronologically, every line received
+  from the board (`RX` accepted / `CTL` reply / `RAW` other / `DROP` rejected
+  **with the failing check**), every line sent (`TX`, Wi-Fi password redacted),
+  GUI events and button presses (`PC`), the visualizer's de-drift state at 1 Hz
+  (`STATE`, plus a line each time the glitch guard trips), video-stream health
+  (`VID`), and the console — stdout/stderr, uncaught tracebacks from any thread,
+  and Qt messages (`OUT`/`ERR`). A header records the git SHA, board, baud,
+  laptop IP, `connect_config.json` (redacted) and `calibration.json`; a footer
+  summarizes per-tag counts and the drop rate. Hooks live at the source
+  (`Link._ingest`, a new `Link.send_line` wrapper over per-transport
+  `_write_line`, `ConnectionManager.set_active`, `ui_log`), never in the
+  serial-monitor panel. `Link._telemetry_sane` became `_telemetry_fault`,
+  returning *why* a line was rejected. `VideoReceiver` now counts frames
+  abandoned mid-reassembly. The Connect tab shows the active log path.
+  `log/` is gitignored.
+- **Why:** Bugs like the visualizer freak-out could only be diagnosed live —
+  the panel hides telemetry, keeps 2000 lines, and stops draining when hidden,
+  and `_ingest` dropped corrupt lines silently. Now a run leaves an artifact
+  that says exactly which values misbehaved and what the de-drift integrator
+  was doing at the time. designDecisions §21.
+- **Also:** `smoke_gui.py` stubbed out `load_calibration` — it was asserting on
+  roll/pitch rows that this machine's saved `value_flips` negate, so the smoke
+  test failed on any box with flips enabled (pre-existing, unrelated to this
+  change).
+- **Pushed:** no (uncommitted)
+
+## 2026-07-09 17:55 — Visualizer freak-out root-caused: misaligned DMP FIFO reads
+- **What:** Firmware `imuTask` now reads the DMP via the overflow-proof
+  `mpu.dmpGetCurrentFIFOPacket()` (newest packet, drains backlog) and rejects
+  any packet whose quaternion isn't unit-norm (0.96..1.04), calling
+  `resetFIFO()` to restore packet alignment and bumping a `dmpResyncs` counter
+  (`debug` monitor prints `resync=N`). GUI: the `|q|^2` acceptance window
+  tightened from 0.5..2.0 to `QUAT_NORM2_MIN/MAX` (0.96..1.04), and
+  `VisualizerPanel._dedrift` now returns None on a glitch so `_tick` holds the
+  previous frame instead of painting the corrupt orientation.
+- **Why:** The first session log (`log/2026-07-09/log-2026-07-09_17-36-33.txt`)
+  showed it outright: with the camera off, all 234 accepted lines had
+  |q| = 1.0000 and 0.0 deg yaw spread on a stationary board; 4 ms after
+  `cam:ok`, 2132 of 2823 board lines were rejected as bad-quat and the 437 that
+  passed swept +/-180 deg of yaw. The lines were well formed and `ax..gz` (read
+  from the data registers, not the FIFO) stayed correct — so the DMP FIFO read
+  phase had shifted inside a packet and never resynced. One sample was the true
+  quaternion shifted a whole field right. designDecisions §22.
+- **Note:** the GUI window alone is insufficient — replaying the capture through
+  it still accepted 165 misaligned-but-near-unit-norm samples. The firmware
+  resync is what actually fixes it. (If corruption ever survives it, the next
+  step is a gyro-consistency gate: reject a quaternion step that the measured
+  gyro rate cannot explain.)
+- **Verified on hardware (2026-07-09 18:05):** flashed, then provisioned Wi-Fi
+  over serial to bring the camera up. Camera off: 251 lines, |q| 0.9999..1.0000,
+  0 non-unit. Camera on: **1247 lines, |q| 0.9999..1.0000, 0 non-unit (0.0%)**,
+  yaw spread 0.2 deg on a stationary board (was +/-180 deg). `dbg cam:` reports
+  `resync=2` — alignment slipped twice as the camera started, the guard caught
+  both, and the counter stayed at 2 thereafter with video steady at 10 fps.
+  Serial tearing persists at ~0.3% (4 malformed lines in 1247); those parse as
+  `RAW` and are ignored, unchanged by this work.
+- **Pushed:** no (uncommitted)

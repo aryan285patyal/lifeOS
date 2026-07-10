@@ -61,10 +61,8 @@ check them off (and date them) when done.
   SDA 21 / SCL 14 / INT 47 / servos 1, 2; README/CLAUDE.md/designDecisions §16.
   Still to validate on hardware: wire the MPU + servos to the new pins, flash
   (ESP32S3 Dev Module, 16MB, OPI PSRAM), run the USB → wireless flow end-to-end.
-- [ ] **Real OV3660 camera video** — esp_camera integration on the S3-CAM
-  (PSRAM frame buffers, JPEG), stream over the existing Wi-Fi video path
-  (5010), render in the GUI (Hand Model tab source dropdown). Replaces the
-  synthetic frame stream.
+- [x] **Real OV3660 camera video** *(done 2026-07-08)* — see the
+  "OV3660 camera feed (S3-CAM)" entry at the bottom of this section.
 - [ ] **GUI firmware-flash button** — flash the right firmware for the selected
   board from the GUI (arduino-cli/esptool under the hood; fold into the
   Settings menu below). Discuss design first.
@@ -116,3 +114,20 @@ check them off (and date them) when done.
   Wi-Fi adapter's address if Ethernet stays plugged). Production hardening
   ideas (subnet-mismatch warning, reachability probe + auto-fallback,
   ESP-NOW dongle) live in fixes.md §1.
+- [x] **OV3660 camera feed (S3-CAM)** *(done 2026-07-08)* — real JPEG frames
+  (VGA, ~10 fps, sensor-compressed) chunked over UDP 5010 as `vf:` packets;
+  `VideoReceiver` + live preview in the Hand Model tab ("ESP32 camera" source,
+  fps/KB status); synthetic `vid:` stream kept as fallback; wifi_video_test.py
+  measures both and can --save a frame. designDecisions §18. Needs a flash +
+  on-hardware check (camera init is the first real test of the EYE pin map).
+- [x] **Session logging to disk** *(done 2026-07-09)* — `session_log.py`: one
+  file per GUI run under `log/<date>/`, holding every board line (including the
+  ones `_ingest` rejects, with the reason), every sent command, button presses,
+  the visualizer's de-drift state at 1 Hz, video health, and the console
+  (tracebacks + Qt messages). Read this file to find which values misbehaved
+  instead of reproducing the bug live. designDecisions §21.
+- [ ] **Prune old `log/` folders** — logs are kept forever by choice
+  (~20 MB/hour of running). If the disk gets tight, delete old date folders by
+  hand, or add a startup prune (age or total-size cap).
+- [ ] **Hand tracking on the selected video source** — next step now that the
+  Hand Model tab has live frames (ESP32 or PC camera).

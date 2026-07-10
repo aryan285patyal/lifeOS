@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QDialog, QPlainTextEdit,
 )
 from PySide6.QtCore import QTimer, Qt, QUrl, QObject, Signal, QEvent
-from PySide6.QtGui import QColor, QFontDatabase
+from PySide6.QtGui import QColor, QFontDatabase, QImage, QPixmap
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 try:
@@ -28,6 +28,7 @@ from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
 from CleanInput import CleanInput, convert, format_converted, set_accel_scale
 from live_charts import sparkline_for
+import session_log
 
 QUAT = ["q0", "q1", "q2", "q3"]
 
@@ -49,6 +50,11 @@ UDP_PORT = 5005                       # telemetry port (legacy WiFi sensor mode)
 CMD_PORT = 5006                       # legacy WiFi command/hello port
 VIDEO_PORT = 5010                     # laptop receives Wi-Fi video UDP here (matches lifeOs.ino)
 RAW_LOG_LINES = 2000                  # per-link ring buffer feeding the serial-monitor panel
+SERIAL_BAUD = 921600                  # S3 USB feed (matches Serial.begin in lifeOs.ino);
+                                      # 115200 was ~65% full at 50 Hz telemetry, so any
+                                      # concurrent firmware print tore lines. BT COM
+                                      # ports ignore the baud, so the frozen WROOM-32
+                                      # path is unaffected.
 
 # mDNS service the ESP32 advertises (MDNS.addService("lifeos", "udp", ...)).
 SERVICE_TYPE = "_lifeos._udp.local."
@@ -81,6 +87,7 @@ _ui_log_seq = 0
 
 def ui_log(text):
     global _ui_log_seq
+    session_log.log("PC", text)
     with _ui_log_lock:
         _ui_log.append((_ui_log_seq, text))
         _ui_log_seq += 1
@@ -238,7 +245,7 @@ def probe_lifeos_port(timeout=1.5, skip=None, progress=None):
         if progress:
             progress(dev)
         try:
-            with serial.Serial(dev, 115200, timeout=0.3, write_timeout=0.5) as s:
+            with serial.Serial(dev, SERIAL_BAUD, timeout=0.3, write_timeout=0.5) as s:
                 try:
                     s.write(b"id?\n")
                 except Exception:
@@ -271,11 +278,23 @@ SIXCAL_CAPTURE_SECS = 10.0    # per-face averaging window after Calibrate is pre
 SIXCAL_MIN_SAMPLES = 100      # fewer fresh samples than this in the window = abort
 SIXCAL_REPLY_TIMEOUT = 5.0    # seconds to wait for the ESP32's acal reply
 
+# Telemetry acceptance window for |q|^2. The DMP emits unit quaternions (a clean
+# capture measured |q| = 1.0000 on every one of 234 lines); a FIFO packet read
+# out of alignment lands anywhere in 0.7..1.4, so +/-2% separates them cleanly.
+QUAT_NORM2_MIN = 0.96
+QUAT_NORM2_MAX = 1.04
+
 # Stillness detection for the Visualizer's yaw de-drift, on the raw counts
 # (DMP full scales: accel +/-2g -> 16384 LSB/g, gyro +/-2000 dps -> 16.4 LSB/dps).
 STILL_GYRO_COUNTS = 60      # per-axis |gyro| below this (~3.7 deg/s) = not rotating
 STILL_ACCEL_DELTA = 1200    # | |accel| - 1g | below this = not accelerating
 STILL_MIN_SECS = 0.5        # stillness must hold this long before it's trusted
+# De-drift glitch guards: a yaw step over GLITCH_DEG between ~33 ms ticks
+# (>1000 deg/s) is corrupt data, not rotation; real yaw creep is well under
+# 1 deg/s, so learning is gated and the learned rate clamped.
+DEDRIFT_GLITCH_DEG = 45.0       # ignore a tick with a bigger yaw step
+DEDRIFT_RATE_LEARN_MAX = 5.0    # only learn drift from |dyaw/dt| below this (deg/s)
+DEDRIFT_RATE_CLAMP = 2.0        # learned drift rate can never exceed this (deg/s)
 
 COLOR_REAL = "#2e7d32"      # green - value came from a fresh packet
 COLOR_ASSUMED = "#c62828"   # red   - value was held over (missing/garbled)
@@ -299,6 +318,31 @@ class Link:
 
     # non-telemetry replies the ESP32 sends over the same stream, kept per prefix
     CONTROL_PREFIXES = ("cal:", "acal:", "wifi:", "id:", "feed:")
+    # a line must carry all of these to be trusted as a telemetry sample -
+    # a fragment (telemetry spliced by a stray firmware log print sharing the
+    # USB serial) can still parse as valid key:vals, and wholesale-replacing
+    # `latest` with it made the quaternion consumers (visualizer, relative
+    # table) jump wildly while the raw table looked fine
+    TELEMETRY_KEYS = ("q0", "q1", "q2", "q3", "ax", "ay", "az", "gx", "gy", "gz")
+    RAW_KEYS = ("ax", "ay", "az", "gx", "gy", "gz", "tp")  # int16 sensor counts
+
+    @classmethod
+    def _telemetry_fault(cls, d):
+        """Value-level sanity: a torn line can lose single bytes and still
+        parse (e.g. 'q0:0.9948' minus its dot = 9948.0), so key presence
+        alone isn't proof. The DMP only emits unit quaternions and the raw
+        counts are int16. Returns the failing check (for the session log's
+        DROP line), or None when the sample is sane.
+
+        The quaternion window is tight on purpose: the DMP's output is unit-norm
+        to 4 decimal places (measured over a clean capture), while a misaligned
+        FIFO packet produces norms anywhere in 0.7..1.4 - a loose window let
+        those through and they drove the 3D view through +/-180 deg of yaw."""
+        n2 = sum(d[k] * d[k] for k in QUAT)
+        if not (QUAT_NORM2_MIN <= n2 <= QUAT_NORM2_MAX):
+            return f"bad-quat |q|^2={n2:.4g}"
+        bad = [f"{k}={d[k]}" for k in cls.RAW_KEYS if k in d and abs(d[k]) > 40000]
+        return ("bad-counts " + ",".join(bad)) if bad else None
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -309,9 +353,15 @@ class Link:
         self.raw_seq = 0
 
     def _ingest(self, text):
+        """Classify one received line, and record it in the session log under
+        the tag that says what became of it - including the two rejection paths,
+        which are otherwise invisible after the fact."""
+        if not text:
+            return
         with self.lock:
             self.raw_log.append((self.raw_seq, text))
             self.raw_seq += 1
+        via = self.transport_tag()
         try:
             d = parse_line(text)
         except Exception:
@@ -319,11 +369,22 @@ class Link:
                 if text.startswith(prefix):
                     with self.lock:
                         self.controls[prefix] = (text, time.monotonic())
-                    break
+                    session_log.log("CTL", text, via)
+                    return
+            session_log.log("RAW", text, via)   # boot banner, driver prints, ...
+            return
+        missing = [k for k in self.TELEMETRY_KEYS if k not in d]
+        if missing:         # fragment: keep the last good sample instead
+            session_log.log("DROP", f"fragment missing {','.join(missing)} :: {text}", via)
+            return
+        fault = self._telemetry_fault(d)
+        if fault:           # parseable but corrupt values: same treatment
+            session_log.log("DROP", f"{fault} :: {text}", via)
             return
         with self.lock:
             self.latest = d
             self.last_seen = time.monotonic()
+        session_log.log("RX", text, via)
 
     def snapshot(self):
         with self.lock:
@@ -349,6 +410,18 @@ class Link:
         with self.lock:
             return (time.monotonic() - self.last_seen) <= timeout
 
+    def send_line(self, text):
+        """Send one raw control line (e.g. 'cal', 'e0:0', 'wifi:off'). Every
+        caller and every transport funnels through here, so this is where the
+        outgoing line is logged (the Wi-Fi password is redacted)."""
+        ok = self._write_line(text)
+        session_log.log("TX", session_log.redact(text) + ("" if ok else "   << SEND FAILED"),
+                        self.transport_tag())
+        return ok
+
+    def send_servos(self, angles):
+        return self.send_line(",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)))
+
     # --- overridden per transport ---
     def start(self):
         pass
@@ -356,11 +429,8 @@ class Link:
     def stop(self):
         pass
 
-    def send_servos(self, angles):
-        return False
-
-    def send_line(self, text):
-        """Send one raw control line (e.g. 'cal', 'e0:0', 'wifi:off')."""
+    def _write_line(self, text):
+        """Put one line on the wire. Returns True if it was written."""
         return False
 
     def description(self):
@@ -414,11 +484,14 @@ class WifiLink(Link):
             self.peer_ip = ip
         try:
             self.tx_sock.sendto(b"hello", (ip, CMD_PORT))
-            return True
+            ok = True
         except OSError:
-            return False
+            ok = False
+        session_log.log("TX", f"hello -> {ip}:{CMD_PORT}"
+                        + ("" if ok else "   << SEND FAILED"), "WiFi")
+        return ok
 
-    def send_line(self, text):
+    def _write_line(self, text):
         """Send one control line as a UDP datagram to the ESP32's command port
         (the S3 firmware dispatches it exactly like a serial/BT line)."""
         with self.lock:
@@ -430,9 +503,6 @@ class WifiLink(Link):
             return True
         except OSError:
             return False
-
-    def send_servos(self, angles):
-        return self.send_line(",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)))
 
     def description(self):
         with self.lock:
@@ -459,7 +529,7 @@ class BluetoothLink(Link):
 
     def start(self):
         import serial                            # lazy: only needed for Bluetooth
-        self.ser = serial.Serial(self.com, 115200, timeout=1)
+        self.ser = serial.Serial(self.com, SERIAL_BAUD, timeout=1)
         self._running = True
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -482,7 +552,7 @@ class BluetoothLink(Link):
             except Exception:
                 pass
 
-    def send_line(self, text):
+    def _write_line(self, text):
         if not self.ser:
             return False
         try:
@@ -490,9 +560,6 @@ class BluetoothLink(Link):
             return True
         except Exception:
             return False
-
-    def send_servos(self, angles):
-        return self.send_line(",".join(f"s{i}:{int(a)}" for i, a in enumerate(angles)))
 
     def provision_video(self, ssid, password, ip):
         """Send Wi-Fi credentials + the laptop's IP so the ESP32 brings up Wi-Fi
@@ -517,6 +584,7 @@ class ConnectionManager:
     def set_active(self, link):
         old = self.active
         self.active = link
+        session_log.log("PC", f"active link -> {link.description() if link else 'none'}")
         if old is not None and old is not link:
             old.stop()
 
@@ -530,7 +598,10 @@ class ConnectionManager:
         return self.active.send_servos(angles) if self.active else False
 
     def send_line(self, text):
-        return self.active.send_line(text) if self.active else False
+        if not self.active:
+            session_log.log("TX", session_log.redact(text) + "   << no link")
+            return False
+        return self.active.send_line(text)
 
     def control(self, prefix):
         return self.active.control(prefix) if self.active else (None, 0.0)
@@ -545,6 +616,7 @@ class ConnectionManager:
         if self.active:
             self.active.stop()
             self.active = None
+            session_log.log("PC", "active link -> none (disconnected)")
 
     def close(self):
         if self.active:
@@ -777,6 +849,8 @@ class VisualizerPanel(QWidget):
         self._still_since = None    # when the current stillness began
         self._last_yaw = None
         self._last_t = None
+        self._glitches = 0          # de-drift ticks rejected as corrupt data
+        self._last_state_log = 0.0
 
         # Push the latest quaternion to the page at ~30 Hz, independent of the
         # Monitor tab's refresh so the 3D view stays smooth.
@@ -805,12 +879,34 @@ class VisualizerPanel(QWidget):
         return euler_to_quat(roll, pitch, yaw)
 
     def _tick(self):
+        if not self.listener.is_connected():
+            # No live data: freeze the view where it is. Reset the de-drift
+            # bookkeeping so dt/dyaw never span the gap (a stale snapshot
+            # used to keep integrating _drift_rate -> endless yawing).
+            self._last_t = self._last_yaw = self._still_since = None
+            return
         values, _ = self.listener.snapshot()
         if values and all(k in values for k in QUAT):
             q = tuple(float(values[k]) for k in QUAT)
             q = self._dedrift(q, values)
+            if q is None:
+                return          # corrupt sample: hold the last good orientation
             w, x, y, z = self._apply_flips(q)
             self.bridge.orientation.emit(w, x, y, z)
+            self._log_state(w, x, y, z, values)
+
+    def _log_state(self, w, x, y, z, values):
+        """Once a second, record what the 3D view is showing and the de-drift
+        state behind it - the internals that a bad sample used to poison, and
+        which nothing else in the GUI exposes."""
+        now = time.monotonic()
+        if now - self._last_state_log < 1.0:
+            return
+        self._last_state_log = now
+        roll, pitch, yaw = quat_to_euler(w, x, y, z)
+        session_log.log("STATE", f"rpy={roll:.1f},{pitch:.1f},{yaw:.1f} "
+                        f"yaw_off={self._yaw_off:.2f} drift={self._drift_rate:.3f}deg/s "
+                        f"still={int(self._is_still(values))} glitches={self._glitches}")
 
     def _is_still(self, values):
         try:
@@ -822,19 +918,32 @@ class VisualizerPanel(QWidget):
         return max(gyro) < STILL_GYRO_COUNTS and abs(amag - 16384) < STILL_ACCEL_DELTA
 
     def _dedrift(self, q, values):
+        """Yaw-drift-compensated quaternion, or None when this sample is a
+        glitch and the view should keep showing the previous frame."""
         now = time.monotonic()
         yaw = quat_yaw(*q)
         dt = (now - self._last_t) if self._last_t is not None else 0.0
         dyaw = wrap180(yaw - self._last_yaw) if self._last_yaw is not None else 0.0
         self._last_t, self._last_yaw = now, yaw
 
+        if abs(dyaw) > DEDRIFT_GLITCH_DEG:
+            # >1000 deg/s between ticks is corrupt data, not rotation.
+            # Integrating such a step used to poison _yaw_off and _drift_rate
+            # for minutes after a single bad sample - skip it entirely.
+            self._glitches += 1
+            session_log.log("STATE", f"glitch #{self._glitches}: dyaw={dyaw:.1f} deg "
+                            f"in {dt * 1000:.0f} ms - ignored")
+            return None         # don't paint it either: hold the last frame
+
         if self._is_still(values):
             if self._still_since is None:
                 self._still_since = now
             elif now - self._still_since >= STILL_MIN_SECS:
                 self._yaw_off += dyaw          # still => this yaw change is drift
-                if dt > 0:
+                if dt > 0 and abs(dyaw / dt) < DEDRIFT_RATE_LEARN_MAX:
                     self._drift_rate += 0.02 * (dyaw / dt - self._drift_rate)
+                    self._drift_rate = max(-DEDRIFT_RATE_CLAMP,
+                                           min(DEDRIFT_RATE_CLAMP, self._drift_rate))
         else:
             self._still_since = None
             self._yaw_off += self._drift_rate * dt
@@ -1079,6 +1188,19 @@ class ConnectTab(QWidget):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
+
+        # Where this run's full record is being written (see session_log.py).
+        log_path = session_log.path()
+        self.log_label = QLabel(f"Session log: {log_path}" if log_path
+                                else "Session log: not writing")
+        self.log_label.setToolTip(
+            "Every line received and sent this run, every button press, and the "
+            "console output are appended here - copy the path when reporting a bug.")
+        self.log_label.setAlignment(Qt.AlignCenter)
+        self.log_label.setWordWrap(True)
+        self.log_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.log_label.setStyleSheet("color: #7a848e;")
+        root.addWidget(self.log_label)
 
         root.addWidget(self._build_bt_group())
         root.addWidget(self._build_video_group())
@@ -1420,29 +1542,109 @@ class ConnectTab(QWidget):
             self.connect_video()
 
 
+class VideoReceiver:
+    """Wi-Fi UDP video listener on VIDEO_PORT. Reassembles the S3-CAM's
+    'vf:<frame>:<idx>/<count>:<jpeg-bytes>' chunks into complete JPEG frames
+    (latest complete frame wins; an unfinished frame is abandoned as soon as
+    a newer one starts - no retransmit, right for live view) and counts the
+    legacy synthetic 'vid:' packets so the GUI can say which stream it is
+    actually receiving. Poll latest_frame() from the GUI thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sock = None
+        self._running = False
+        self.jpeg = None                # last complete frame
+        self.frames = 0                 # complete frames received
+        self.incomplete = 0             # frames abandoned mid-reassembly (lost chunks)
+        self.synth_packets = 0          # legacy vid: packets seen
+        self._times = collections.deque(maxlen=30)  # completion times (fps)
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self.sock.bind(("0.0.0.0", VIDEO_PORT))
+        self.sock.settimeout(0.5)
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def _run(self):
+        cur_id, chunks, total = None, {}, 0
+        while self._running:
+            try:
+                data, _addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break                    # socket closed by stop()
+            if data.startswith(b"vid:"):
+                with self.lock:
+                    self.synth_packets += 1
+                continue
+            if not data.startswith(b"vf:"):
+                continue
+            try:                         # vf:<frame>:<idx>/<count>:<payload>
+                p1 = data.index(b":", 3)
+                p2 = data.index(b":", p1 + 1)
+                fid = int(data[3:p1])
+                idx_s, cnt_s = data[p1 + 1:p2].split(b"/")
+                idx, cnt = int(idx_s), int(cnt_s)
+            except (ValueError, IndexError):
+                continue
+            if cur_id is None or fid > cur_id:   # newer frame -> drop the old
+                if chunks and len(chunks) < total:
+                    with self.lock:              # the old one never completed
+                        self.incomplete += 1
+                cur_id, chunks, total = fid, {}, cnt
+            elif fid < cur_id:
+                continue                 # stale straggler from a dropped frame
+            chunks[idx] = data[p2 + 1:]
+            if total and len(chunks) == total:
+                jpeg = b"".join(chunks[i] for i in range(total))
+                with self.lock:
+                    self.jpeg = jpeg
+                    self.frames += 1
+                    self._times.append(time.monotonic())
+                cur_id, chunks, total = None, {}, 0
+
+    def latest_frame(self):
+        """(jpeg bytes or None, frame count, fps over ~2 s, synth packets,
+        frames abandoned mid-reassembly)."""
+        with self.lock:
+            now = time.monotonic()
+            fps = len([t for t in self._times if now - t <= 2.0]) / 2.0
+            return self.jpeg, self.frames, fps, self.synth_packets, self.incomplete
+
+
 class HandModelTab(QWidget):
     """Video-input preview for the future hand-detection model. The dropdown
-    lists every video input device on this PC (e.g. the laptop webcam); Apply
-    streams the selected one into the preview box next to the selector. The
-    ESP32's Wi-Fi UDP video will be added as another selectable source later."""
+    offers the ESP32's Wi-Fi UDP camera stream (JPEG frames reassembled by
+    VideoReceiver) plus every PC video input device (QtMultimedia); Apply
+    streams the selected source into the preview box next to the selector.
+    The ESP32 source works even without QtMultimedia."""
+
+    ESP_SOURCE = f"ESP32 camera (Wi-Fi UDP :{VIDEO_PORT})"
 
     def __init__(self):
         super().__init__()
-        self._devices = []          # QCameraDevice per combo row
+        self._devices = []          # QCameraDevice per combo row (after ESP row)
         self._camera = None
         self._session = None
+        self._receiver = None       # VideoReceiver while the ESP source is live
+        self._shown_frame = -1      # last frame count painted
+        self._frame_size = "?"      # dimensions of the last decoded frame
+        self._last_vid_log = 0.0
 
         root = QVBoxLayout(self)
-
-        if not HAVE_MULTIMEDIA:
-            msg = QLabel("PySide6 QtMultimedia is not available - reinstall "
-                         "PySide6 to use video input here.")
-            msg.setWordWrap(True)
-            msg.setAlignment(Qt.AlignCenter)
-            root.addWidget(msg)
-            root.addStretch(1)
-            return
-
         row = QHBoxLayout()
 
         controls = QVBoxLayout()
@@ -1459,53 +1661,123 @@ class HandModelTab(QWidget):
         btn_row.addWidget(self.apply_btn)
         controls.addLayout(btn_row)
 
-        self.status_label = QLabel("Pick a device and press Apply.")
+        self.status_label = QLabel("Pick a source and press Apply.")
         self.status_label.setWordWrap(True)
         controls.addWidget(self.status_label)
         controls.addStretch(1)
         row.addLayout(controls, 1)
 
-        self.video = QVideoWidget()
-        self.video.setFixedSize(320, 240)     # small preview beside the selector
-        row.addWidget(self.video)
+        # Preview: page 0 paints ESP32 JPEG frames, page 1 is the PC camera.
+        self.preview = QStackedWidget()
+        self.preview.setFixedSize(320, 240)   # small preview beside the selector
+        self.esp_view = QLabel("no frames yet")
+        self.esp_view.setAlignment(Qt.AlignCenter)
+        self.esp_view.setStyleSheet("background: #101418; color: #c8d2dc;")
+        self.preview.addWidget(self.esp_view)
+        if HAVE_MULTIMEDIA:
+            self.video = QVideoWidget()
+            self.preview.addWidget(self.video)
+        row.addWidget(self.preview)
 
         root.addLayout(row)
         root.addStretch(1)
+
+        if not HAVE_MULTIMEDIA:
+            self.status_label.setText(
+                "QtMultimedia unavailable - PC cameras are hidden, but the "
+                "ESP32 Wi-Fi source still works.")
+
+        self.frame_timer = QTimer(self)
+        self.frame_timer.timeout.connect(self._poll_frames)
 
         self.refresh_devices()
 
     def refresh_devices(self):
         prev = self.device_combo.currentText()
         self.device_combo.clear()
-        self._devices = list(QMediaDevices.videoInputs())
+        self.device_combo.addItem(self.ESP_SOURCE)      # always row 0
+        self._devices = list(QMediaDevices.videoInputs()) if HAVE_MULTIMEDIA else []
         for dev in self._devices:
             self.device_combo.addItem(dev.description())
-        if not self._devices:
-            self.device_combo.addItem("(no video input devices found)")
         idx = self.device_combo.findText(prev)
         if idx >= 0:
             self.device_combo.setCurrentIndex(idx)
 
     def apply(self):
         idx = self.device_combo.currentIndex()
-        if not (0 <= idx < len(self._devices)):
+        if idx == 0:
+            self._start_esp()
+            return
+        didx = idx - 1
+        if not (0 <= didx < len(self._devices)):
             self.status_label.setText("No video input device selected.")
             return
         self.stop()
-        dev = self._devices[idx]
+        dev = self._devices[didx]
         self._camera = QCamera(dev)
         self._camera.errorOccurred.connect(self._on_camera_error)
         self._session = QMediaCaptureSession(self)
         self._session.setCamera(self._camera)
         self._session.setVideoOutput(self.video)
         self._camera.start()
+        self.preview.setCurrentWidget(self.video)
         self.status_label.setText(f"Streaming: {dev.description()}")
+
+    def _start_esp(self):
+        self.stop()
+        receiver = VideoReceiver()
+        try:
+            receiver.start()
+        except OSError as e:
+            self.status_label.setText(
+                f"Could not listen on UDP {VIDEO_PORT}: {e} "
+                f"(is wifi_video_test.py running?)")
+            return
+        self._receiver = receiver
+        self.preview.setCurrentWidget(self.esp_view)
+        self.esp_view.setText("waiting for frames...")
+        self.frame_timer.start(66)              # ~15 Hz repaint cap
+        self.status_label.setText(
+            f"Listening on UDP {VIDEO_PORT}. If nothing arrives: provision "
+            f"Wi-Fi video in the Connect tab (and see fixes.md if the laptop "
+            f"is on a different network).")
+
+    def _poll_frames(self):
+        if not self._receiver:
+            return
+        jpeg, frames, fps, synth, incomplete = self._receiver.latest_frame()
+        now = time.monotonic()
+        if jpeg and frames != self._shown_frame:
+            img = QImage.fromData(jpeg)
+            if not img.isNull():
+                self.esp_view.setPixmap(QPixmap.fromImage(img).scaled(
+                    self.esp_view.size(), Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation))
+                self._frame_size = f"{img.width()}x{img.height()}"
+            self._shown_frame = frames
+            self.status_label.setText(
+                f"ESP32 camera: {img.width()}x{img.height()}, {fps:.1f} fps, "
+                f"{len(jpeg) // 1024} KB/frame")
+            if now - self._last_vid_log >= 1.0:
+                self._last_vid_log = now
+                session_log.log("VID", f"{self._frame_size}, {fps:.1f} fps, "
+                                f"{len(jpeg) // 1024} KB/frame, {frames} frames, "
+                                f"{incomplete} incomplete")
+        elif synth and not frames:
+            self.status_label.setText(
+                "Receiving the synthetic test stream - the ESP32's camera is "
+                "not live (look for cam:error in the serial monitor).")
+            if now - self._last_vid_log >= 5.0:
+                self._last_vid_log = now
+                session_log.log("VID", f"synthetic stream only ({synth} packets) "
+                                f"- the camera is not live")
 
     def _on_camera_error(self, _error, message):
         self.status_label.setText(f"Camera error: {message}")
 
     def stop(self):
-        """Release the camera (so other apps can use it / on window close)."""
+        """Release the camera / receiver (so other apps can use the webcam,
+        and the UDP port frees up)."""
         if self._camera is not None:
             try:
                 self._camera.stop()
@@ -1513,6 +1785,11 @@ class HandModelTab(QWidget):
                 pass
             self._camera = None
         self._session = None
+        if self._receiver is not None:
+            self._receiver.stop()
+            self._receiver = None
+        self.frame_timer.stop()
+        self._shown_frame = -1
 
 
 class SixPointCalDialog(QDialog):
@@ -2037,6 +2314,7 @@ class MonitorWindow(QMainWindow):
         cal["value_flips"] = flips
         save_calibration(cal)
         self.visualizer.set_flips(flips)
+        session_log.log("PC", f"value flips -> {flips}")
 
     def start_calibration(self):
         """Recalibrate at the source first: ask the ESP32 to re-run its
@@ -2121,6 +2399,9 @@ class MonitorWindow(QMainWindow):
                 if quat:
                     self._euler_zero = quat_to_euler(*quat)   # zero pose for the angle table
                 self.calib_status_label.setText("Calibrated. New zero set.")
+                # every displayed count is shifted by these, so a wrong zero
+                # otherwise looks exactly like a misbehaving sensor
+                session_log.log("PC", f"zero locked in: offsets={self.offsets}")
             else:
                 self.calib_status_label.setText(
                     f"Calibrating... {CALIB_SAMPLES - self.calib_left}/{CALIB_SAMPLES}")
@@ -2205,12 +2486,22 @@ class MonitorWindow(QMainWindow):
 
 
 def main():
+    # Open this run's log file before anything else, so even a crash during
+    # startup is on disk, then tee the console into it.
+    cfg, cal = load_connect_config(), load_calibration()
+    session_log.start({"board": cfg.get("board", "s3cam"),
+                       "serial_baud": SERIAL_BAUD,
+                       "laptop_ip": get_local_ip(),
+                       "connect_config": cfg,
+                       "calibration": cal})
+    session_log.install_console_capture()
+
     # QtWebEngine wants shared GL contexts set before the QApplication exists.
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     # 6-position accel scale factors from a previous calibration (bias is on
     # the ESP32 itself, re-applied from NVS at every boot)
-    set_accel_scale(load_calibration().get("accel_scale", {}))
+    set_accel_scale(cal.get("accel_scale", {}))
     manager = ConnectionManager()
     win = MonitorWindow(manager)
     win.showMaximized()   # full working area, title-bar buttons always visible

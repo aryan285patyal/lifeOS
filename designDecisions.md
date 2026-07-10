@@ -316,3 +316,152 @@ own) keeps the stream visible while operating other tabs — watching replies
 while pressing Connect/Go wireless is the whole point. Persisting the toggle
 matches the board dropdown's behavior (§16): debugging sessions span many GUI
 restarts.
+
+## 18. Camera video: JPEG-over-UDP chunks, latest-wins, synthetic fallback
+
+**Decision:** The S3-CAM streams real OV3660 frames as sensor-compressed JPEG
+(VGA, quality 12, ~10 fps, frame buffers in PSRAM, `CAMERA_GRAB_LATEST`),
+sent to `laptop:5010` as UDP chunks:
+`vf:<frame_id>:<chunk_idx>/<chunk_count>:<binary JPEG bytes>` with ~1200-byte
+payloads (under the 1472-byte MTU). The receiver (`VideoReceiver` in gui.py,
+mirrored in wifi_video_test.py) reassembles by frame id and **drops an
+incomplete frame the moment a chunk of a newer frame arrives** - no
+retransmit, no reordering buffer. Camera init happens lazily on the first
+transition to streaming; on failure the firmware sends `cam:error,<code>`
+once and falls back to the legacy synthetic `vid:<seq>:` stream, which is
+also what the camera-less WROOM-32 always sends. The camera pin map is the
+stock `CAMERA_MODEL_ESP32S3_EYE` set (XCLK 15, SIOD 4, SIOC 5, VSYNC 6,
+HREF 7, PCLK 13, D0..D7 = 11,9,8,10,12,18,17,16), which is what the GOOUUU
+S3-CAM wires.
+
+**Why:** JPEG straight off the sensor keeps the ESP32 out of the encoding
+business and a VGA frame down to ~15-35 KB - a dozen-odd chunks, well within
+Wi-Fi UDP budget at 10 fps. Latest-wins dropping is the right policy for a
+live viewfinder feeding future hand tracking: a stale frame is worth less
+than nothing, and retransmit machinery (or TCP) would add latency exactly
+when the link is struggling. Keeping the synthetic stream as the fallback
+preserves a transport test that needs no working sensor (it just proved the
+same-subnet fix with 0% loss) and gives the WROOM-32 parity. The GUI shows
+which stream kind it is receiving so a camera failure is visible, not silent.
+
+## 19. Core split flipped: IMU on core 1; core 0 belongs to Wi-Fi + camera
+
+**Decision:** The IMU task is pinned to **core 1** (priority 3, above
+loop()'s priority 1), leaving **core 0** to the prebuilt Arduino SDK's
+immovable tenants: the Wi-Fi stack task and the camera driver's
+near-max-priority cam_task (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0 and
+CONFIG_CAMERA_CORE0 are baked into the precompiled esp32s3 libs).
+Complementary camera tuning: XCLK 10 MHz (sensor ~10-12 fps, matching the
+10 fps send rate) and LEDC timer 2 / channel 6 for the camera clock, clear
+of the servos' channels (ESP32Servo assigns from channel 0 upward).
+Supersedes the core assignment in §2 (IMU on core 0, senders on core 1) -
+the *principle* (FIFO reads must never be starved by the radio/camera)
+stands; only the core numbers flipped.
+
+**Why:** First live camera run: cam_task saturated core 0 and the priority-3
+IMU task never ran again - no MPU data, plus cam_hal FB-OVF because even
+cam_task fell behind at 20 MHz XCLK. The camera's and Wi-Fi's cores are
+compile-time constants of the prebuilt SDK (changing them means rebuilding
+the whole core), while our task is one argument to change. On core 1 the IMU
+preempts the feed/video senders cleanly, and the senders' vTaskDelay yields
+keep loop() responsive. The LEDC move fixes a latent clash where the camera
+clock silently reprogrammed servo 0's PWM channel.
+
+## 20. S3-only development; telemetry robustness; feed serial at 921600
+
+**Decision (user, 2026-07-08):** The ESP32-S3-CAM is the only actively
+developed board from now on. The WROOM-32 code paths stay in the tree as
+frozen legacy - no more changes or compile verification for them.
+
+**Telemetry robustness (both sides):** the feed's USB serial line proved
+tearable under load (two firmware writers + 65% line utilization at 115200),
+so the system now defends in depth:
+- Feed baud raised to **921600** (`SERIAL_BAUD` in gui.py = `Serial.begin`
+  in lifeOs.ino; telemetry now ~8% of the line). BT COM ports ignore baud.
+- GUI `Link._ingest` accepts a line as telemetry only if it has the full
+  q0..q3+ax..gz key set AND sane values (unit-norm quaternion, int16-range
+  raw counts) - a torn line that parses (e.g. a float missing its decimal
+  point) can never displace the last good sample.
+- The visualizer's yaw de-drift ignores per-tick yaw steps > 45 deg
+  (corrupt data, not rotation), learns the drift rate only from plausible
+  rates (< 5 deg/s), clamps it (2 deg/s), and freezes entirely (with state
+  reset) while the link is disconnected - previously a stale snapshot kept
+  integrating the learned rate, yawing the view forever after unplug.
+
+**Why:** One corrupt sample used to poison the de-drift integrator/EMA for
+minutes - the "works briefly then freaks out" pattern. Filtering at ingest
+protects every consumer (visualizer, relative table, calibration captures);
+the de-drift guards protect against whatever still slips through; the baud
+raise attacks the tearing itself. S3-only reflects where the hardware effort
+goes (camera, wireless feed); the WROOM's BT-SPP path has no camera and no
+future work planned.
+
+## 21. Per-run session log on disk (`log/<date>/log-<date>_<time>.txt`)
+
+**Decision:** Every GUI run opens its own log file and writes a chronological
+record of everything: each line the board sends (tagged `RX` accepted
+telemetry, `CTL` control reply, `RAW` other output, `DROP` rejected + the
+reason), each line the GUI sends (`TX`), GUI events (`PC`), the visualizer's
+de-drift internals once a second (`STATE`), video-stream health (`VID`), and
+the console — stdout/stderr, uncaught tracebacks from any thread, and Qt's own
+messages (`OUT`/`ERR`). Plain aligned text, one line per event, timestamped
+`HH:MM:SS.mmm`; the date, git SHA, board, baud, and the contents of
+`connect_config.json` (password redacted) and `calibration.json` go in a header,
+and a footer summarizes the counts and the drop rate. Logs are kept forever
+(user decision) and gitignored. Implemented in `session_log.py`.
+
+**Why:** Debugging was a live activity — the bug had to be reproduced while
+someone watched. The serial-monitor panel cannot serve as the record: it hides
+telemetry by default, holds only 2000 lines, and stops draining while hidden.
+So the log is written **at the source** (`Link._ingest` / `Link.send_line`),
+not by scraping the panel. Two tags exist purely for diagnosis: `DROP` makes
+`_ingest`'s previously *silent* rejections visible with the failing check
+(`fragment` / `bad-quat` / `bad-counts`), and `STATE` exposes `_yaw_off` /
+`_drift_rate` / stillness — the integrator state that a single corrupt sample
+used to poison (§20), which nothing else in the GUI shows. The header pins down
+the calibration and code version, because a wrong zero or a stale scale factor
+is indistinguishable from a bad sensor when you only have the numbers.
+
+**Mechanics:** the file is line-buffered, so a crash or hard kill still leaves
+every line up to that instant on disk; `log()` is a no-op before `start()` (so
+`smoke_gui.py` writes nothing) and swallows every exception — a logger must
+never take the app down. At ~60 lines/s (~6 KB/s, ~20 MB/hour) a flush per line
+is free, so there is no writer thread to leak or join. Supersedes nothing; the
+serial-monitor panel (§17) stays as the live view.
+
+## 22. DMP FIFO reads must be alignment-checked (the visualizer freak-out)
+
+**Decision:** `imuTask` reads the DMP with the library's overflow-proof
+`dmpGetCurrentFIFOPacket()` (which drains the backlog and returns the *newest*
+packet) and then validates the quaternion's norm: `|q|^2` outside 0.96..1.04
+means the packet was misaligned, so the firmware calls `resetFIFO()`, counts a
+resync (`dmpResyncs`, shown on the `debug` monitor as `resync=N`) and skips the
+sample. The GUI's acceptance window was likewise tightened from
+`0.5 <= |q|^2 <= 2.0` to `QUAT_NORM2_MIN/MAX` (0.96..1.04), and the visualizer
+now *holds the previous frame* when its de-drift glitch guard trips instead of
+painting the corrupt orientation.
+
+**Why:** The first full session log (2026-07-09 17:36) settled a bug that had
+survived three earlier rounds of guessing. Every telemetry line with `wf:0`
+(camera off) carried `|q| = 1.0000` exactly and 0.0 deg of yaw spread on a
+stationary board; from 4 ms after `cam:ok`, 2132 of 2823 board lines were
+rejected as `bad-quat` and the 437 that slipped through spanned the full
++/-180 deg of yaw. The lines were *well formed* (all keys, correct commas), and
+`ax..gz` - which come from the data registers, not the FIFO - stayed perfectly
+sane throughout. One accepted sample read `q = [-0.4478, 0.9996, -0.0101,
+-0.0263]`: the true quaternion shifted one field right with garbage prepended.
+That is packet misalignment, not a torn serial line.
+
+The old code read `getFIFOCount()` then `getFIFOBytes(buf, packetSize)`. Under
+camera/Wi-Fi load the read phase can shift inside a packet (an overflow
+truncates a packet mid-write; a short I2C read consumes a partial packet), and
+nothing ever resynced it: a phase-shifted stream never overflows again, so
+every subsequent quaternion was two half-packets glued together, forever.
+Accel/gyro were unaffected, which is exactly why the bug looked like "the
+visualizer freaks out" rather than "the sensor is broken".
+
+**Note:** the tightened GUI window is a safety net, not the fix - replaying the
+capture through it still accepted 165 misaligned samples that happened to be
+near unit norm (yaw spread 175 deg on a stationary board). Corruption of this
+kind has to be stopped at the source. Supersedes the `_telemetry_sane` window
+from §20.

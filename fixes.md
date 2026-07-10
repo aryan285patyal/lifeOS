@@ -98,3 +98,96 @@ antenna attached (PA stress).
 **Why deferred:** the PCB antenna is adequate at current desk range; the
 rework only matters for range/enclosure use (production concern, ties into
 fixes.md section 1's wireless reliability).
+
+---
+
+## 3. A dropped serial byte can be silently accepted as a valid sample
+
+*Logged 2026-07-09. Decision: fix later. Harmless for the live display today;
+the only real exposure is Reset / Recalibrate's 20-sample average.*
+
+**Symptom:** ~0.3% of telemetry lines arrive damaged (4 of 1247 over 25 s,
+measured 2026-07-09 after the 921600 baud raise, with the camera streaming).
+Most are rejected — but a specific damage mode is accepted with wrong values.
+
+**Root cause / mechanism (established from `log/2026-07-09/*`):** two distinct
+mechanisms, with very different consequences.
+
+1. **Interleaved print** — an IDF/firmware log line lands in the middle of a
+   telemetry line, splitting it. The first half loses its trailing keys
+   (rejected as `DROP fragment`); the second half starts mid-field and won't
+   parse (`RAW`). **Both rejected. Safe by construction.**
+2. **Dropped byte** — a single character vanishes (seen: `ax848`, colon lost).
+   If it lands on a separator, parsing fails and the line is rejected. If it
+   lands on a **digit inside a numeric field**, every key and separator remains
+   intact, so the line parses and passes the key check. The quaternion is
+   protected (the unit-norm test added in designDecisions §22 catches
+   `q0:0.9948` → `9948.0`), but **a raw count is not**: `az:1638` instead of
+   `az:16384` is in int16 range and is accepted silently.
+
+**Exposure, quantified:**
+- Live display: one wrong sample for 20 ms — a sparkline spike. Invisible.
+- The 3D view and DMP never see the receiver-side zero, so they're unaffected.
+- **Reset / Recalibrate is the real exposure:** `CALIB_SAMPLES = 20`, so one
+  corrupted `az` shifts the zero by ~740 counts (~0.045 g) — a persistent
+  couple-of-degrees offset in the Monitor table until the user re-zeroes.
+- The six-point wizard is effectively immune: ~500 samples per face, so one bad
+  sample moves the mean by ~0.002 g.
+- Odds are low: the tear must fall inside the 0.4 s window *and* hit a digit
+  rather than a separator.
+
+**Debugging done before deferring** (don't repeat):
+- Confirmed the tear rate at 921600 with the camera live (4 malformed / 1247).
+- Confirmed the tears are **not** caused by `cam_hal: FB-OVF` prints (§4):
+  their timestamps never coincide, and one tear predates `cam:ok` entirely.
+  Tearing tracks Wi-Fi/IDF logging generally, not the camera.
+- Verified which of the four damaged lines would have been accepted: none —
+  all four lost a separator or were truncated. The digit-loss case is inferred
+  from the same mechanism (`ax848` proves bytes do get dropped), not observed
+  being accepted.
+
+**Candidate production fixes (in order of value):**
+- **Checksum the telemetry line** — append `ck:<hex>` (XOR/CRC8 of the
+  payload), optional so old firmware still parses. Makes *any* corrupt line
+  impossible to accept, instead of pattern-matching each symptom one at a time.
+  This is the same lesson §22's FIFO bug taught: reject at the source, by
+  construction.
+- **Median instead of mean** for the receiver-side zero (one line in
+  `MonitorWindow.refresh`) — neutralizes any single outlier in the 20 samples.
+- Raise `CALIB_SAMPLES`, or discard samples more than ~3 sigma from the window
+  median before averaging.
+- Stop sharing the UART: on the S3 the feed could run on the native USB CDC
+  while IDF logs stay on UART0 (removes mechanism 1 entirely).
+
+---
+
+## 4. `cam_hal: FB-OVF` bursts while the camera streams
+
+*Logged 2026-07-09. Decision: fix later. Benign at current frame rates.*
+
+**Symptom:** `cam_hal: FB-OVF` appears on the feed in occasional bursts of two
+while Wi-Fi video is streaming.
+
+**Root cause:** the camera driver finished a DMA frame while both frame buffers
+were still checked out — the firmware holds one for the whole duration of
+`sendCameraFrame()` (chunking ~10 KB over UDP). With `fb_count = 2` and
+`CAMERA_GRAB_LATEST` the driver's defined behavior is to drop that frame and
+log FB-OVF. Bursts line up with Wi-Fi stalls, when the UDP send blocks longer
+than usual.
+
+**Impact: none observed.** Frames that arrive are complete JPEGs (receiver
+verifies magic bytes; `wifi_video_test.py` reports 0% incomplete), and the
+stream held a steady 10 fps through FB-OVF bursts during the 2026-07-09
+verification. The cost is a dropped frame. It would only matter if FB-OVF went
+from occasional to constant, which shows up as fps sagging in the `VID` lines
+of the session log.
+
+**Explicitly ruled out:** FB-OVF prints are *not* the cause of the torn serial
+lines in §3 — the timestamps never coincide and tearing predates camera init.
+
+**Candidate production fixes:**
+- **Copy out and return the buffer immediately:** memcpy the JPEG into a PSRAM
+  buffer, `esp_camera_fb_return()` at once, then transmit from the copy — the
+  DMA buffer is then held for microseconds instead of the whole UDP send.
+- Raise `fb_count` to 3 (PSRAM has ample room) for more slack.
+- Lower frame size / raise JPEG quality number if bandwidth is the limit.

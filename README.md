@@ -24,8 +24,9 @@ feed link; the ESP32 joins Wi-Fi and streams high-bandwidth **video** by UDP.
 Sending the laptop's IP each session means a changing DHCP address never breaks
 the link, and nothing is hardcoded. On the S3, `feed:wifi` ("Go wireless")
 additionally moves telemetry + servo commands onto Wi-Fi UDP so the USB cable
-can be unplugged. (No real camera output yet — a synthetic frame stream tests
-the Wi-Fi path; the S3's OV3660 is the planned source.)
+can be unplugged. The S3-CAM's OV3660 streams real JPEG frames (chunked
+`vf:` UDP packets, viewable live in the GUI's Hand Model tab); a synthetic
+frame stream remains the fallback for testing the path without a camera.
 
 ## Wire protocol
 
