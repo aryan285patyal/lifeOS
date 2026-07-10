@@ -342,7 +342,7 @@ designDecisions.md, and to-do.md.
 - **Why:** The whole Wi-Fi path existed to carry real video; this makes the
   camera the payload and gives the Hand Model tab its intended source.
   designDecisions §18.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-08 — Camera init: PSRAM detection + QVGA-in-DRAM fallback
 - **What:** First flash hit "cam_dma_config: frame buffer malloc failed" -
@@ -354,7 +354,7 @@ designDecisions.md, and to-do.md.
   (arduino-cli FQBN ...:FlashSize=16M,PSRAM=opi).
 - **Why:** The camera should degrade to a smaller frame, not die, when the
   flash settings are wrong - and the log should say why.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-08 — Camera/MPU core contention fixed; S3 flashed
 - **What:** With the camera live, cam_hal FB-OVF spam appeared and the MPU
@@ -367,7 +367,7 @@ designDecisions.md, and to-do.md.
   (esptool confirmed 8 MB embedded PSRAM).
 - **Why:** Camera and MPU must run simultaneously - the camera's core
   pinning is baked into the prebuilt SDK, so our task is the one that moves.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-08 — Visualizer/relative-table jumps: spliced telemetry lines fixed
 - **What:** With the camera live, the 3D view and the relative-state table
@@ -384,7 +384,7 @@ designDecisions.md, and to-do.md.
 - **Why:** Two independent writers on one serial line will always interleave
   eventually; the GUI must be robust to torn lines regardless of firmware
   politeness.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-08 — Visualizer freakouts + post-unplug yawing fixed; 921600 baud; S3-only
 - **What:** Three-layer fix for the remaining orientation glitches:
@@ -401,7 +401,7 @@ designDecisions.md, and to-do.md.
 - **Why:** A single corrupt sample poisoned the de-drift integrator and EMA,
   so the view misbehaved long after good data resumed; disconnect exposed
   the open-loop drift integration.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-09 17:20 — Per-run session log (`log/<date>/log-<date>_<time>.txt`)
 - **What:** New `session_log.py`: every GUI run opens its own timestamped log
@@ -429,7 +429,7 @@ designDecisions.md, and to-do.md.
   roll/pitch rows that this machine's saved `value_flips` negate, so the smoke
   test failed on any box with flips enabled (pre-existing, unrelated to this
   change).
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
 
 ## 2026-07-09 17:55 — Visualizer freak-out root-caused: misaligned DMP FIFO reads
 - **What:** Firmware `imuTask` now reads the DMP via the overflow-proof
@@ -461,4 +461,4 @@ designDecisions.md, and to-do.md.
   both, and the counter stayed at 2 thereafter with video steady at 10 fps.
   Serial tearing persists at ~0.3% (4 malformed lines in 1247); those parse as
   `RAW` and are ignored, unchanged by this work.
-- **Pushed:** no (uncommitted)
+- **Pushed:** yes (435212c)
